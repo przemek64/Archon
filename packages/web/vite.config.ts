@@ -32,6 +32,9 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.VITE_API_PORT': JSON.stringify(apiPort),
       'import.meta.env.VITE_APP_VERSION': JSON.stringify(appVersion),
       'import.meta.env.VITE_GIT_COMMIT': JSON.stringify(gitCommit),
+      // Optional per-instance badge so you can tell which frontend you're looking at
+      'import.meta.env.VITE_INSTANCE_LABEL': JSON.stringify(env.VITE_INSTANCE_LABEL ?? ''),
+      'import.meta.env.VITE_INSTANCE_COLOR': JSON.stringify(env.VITE_INSTANCE_COLOR ?? ''),
     },
     resolve: {
       alias: {
@@ -45,10 +48,10 @@ export default defineConfig(({ mode }) => {
       ],
     },
     server: {
-      port: 5173,
+      port: parseInt(env.PORT ?? '5173', 10),
       proxy: {
         '/api': {
-          target: `http://localhost:${apiPort}`,
+          target: env.VITE_PROXY_TARGET ?? `http://localhost:${apiPort}`,
           changeOrigin: true,
         },
       },

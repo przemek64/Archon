@@ -47,6 +47,8 @@ services:
     volumes:
       - ${ARCHON_DATA:-archon_data}:/.archon
       - ${ARCHON_USER_HOME:-archon_user_home}:/home/appuser
+      - C:/dev/projects/cGantt:/host-repos/cGantt:ro
+      - C:/dev/projects/labeltool:/host-repos/labeltool:ro
     networks:
       - archon-network
     restart: unless-stopped

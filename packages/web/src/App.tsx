@@ -14,6 +14,7 @@ import { SettingsPage } from '@/routes/SettingsPage';
 import { LoginPage } from '@/routes/LoginPage';
 import { ConsoleApp } from '@/experiments/console/ConsoleApp';
 import { SessionGate } from '@/components/auth/SessionGate';
+import { InstanceBadge } from '@/components/InstanceBadge';
 
 interface ErrorBoundaryState {
   hasError: boolean;
@@ -66,6 +67,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryStat
 export function App(): React.ReactElement {
   return (
     <ErrorBoundary>
+      <InstanceBadge />
       <QueryClientProvider client={queryClient}>
         <ProjectProvider>
           <BrowserRouter>
