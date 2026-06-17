@@ -11,6 +11,8 @@ description: |
   Reproduction gating: If the issue cannot be reproduced, the workflow does NOT create an issue.
   Instead, it reports what was tried and suggests next steps to the user.
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   # ═══════════════════════════════════════════════════════════════
   # PHASE 1: CLASSIFY — Haiku classification of user's problem
@@ -49,7 +51,6 @@ nodes:
         If no explicit steps given, infer the most likely way to trigger the issue.
 
       Provide reasoning for your classification.
-    model: small
     allowed_tools: []
     output_format:
       type: object
@@ -145,6 +146,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: investigate
+    provider: claude
+    model: opus
     prompt: |
       You are a codebase investigator. Search for code related to the reported problem.
 

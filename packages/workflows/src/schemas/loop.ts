@@ -3,6 +3,38 @@
  */
 import { z } from '@hono/zod-openapi';
 
+/**
+ * A single provider/model target for per-role model selection inside a loop.
+ * Both fields are explicit literals — the engine forwards `model` to the SDK
+ * unchanged (no tier/alias resolution) so the adversarial role mapping is exact.
+ */
+export const roleModelTargetSchema = z.object({
+  provider: z.string().trim().min(1, "roleModels target requires a non-empty 'provider'"),
+  model: z.string().trim().min(1, "roleModels target requires a non-empty 'model'"),
+});
+
+export type RoleModelTarget = z.infer<typeof roleModelTargetSchema>;
+
+/**
+ * Per-role model selection. When present, each loop iteration reads the string
+ * value of `field` from the JSON `stateFile` and picks the matching `map` entry
+ * (case-sensitive). If the file/field is missing or the value has no matching
+ * key, `default` is used. Lets a single loop run its generator and evaluator on
+ * different providers/models — "fresh context AND different mind".
+ */
+export const roleModelsSchema = z.object({
+  /** Path to the JSON state file the loop maintains (supports $ARTIFACTS_DIR). */
+  stateFile: z.string().min(1, "loop.roleModels requires a non-empty 'stateFile'"),
+  /** Top-level JSON field whose string value selects the role. */
+  field: z.string().min(1, "loop.roleModels requires a non-empty 'field'"),
+  /** field-value → provider/model target (case-sensitive keys). */
+  map: z.record(z.string(), roleModelTargetSchema),
+  /** Target used when the file/field is missing or the value has no map key. */
+  default: roleModelTargetSchema,
+});
+
+export type RoleModels = z.infer<typeof roleModelsSchema>;
+
 export const loopNodeConfigSchema = z
   .object({
     /** Inline prompt text executed each iteration. */
@@ -19,6 +51,8 @@ export const loopNodeConfigSchema = z
     interactive: z.boolean().optional(),
     /** Message shown to user when paused (required when interactive is true). */
     gate_message: z.string().optional(),
+    /** Optional per-iteration provider/model selection by role (see roleModelsSchema). */
+    roleModels: roleModelsSchema.optional(),
   })
   .superRefine((data, ctx) => {
     if (data.interactive === true && !data.gate_message) {
@@ -26,6 +60,13 @@ export const loopNodeConfigSchema = z
         code: z.ZodIssueCode.custom,
         message: "interactive loop requires 'loop.gate_message' (non-empty string)",
         path: ['gate_message'],
+      });
+    }
+    if (data.roleModels && Object.keys(data.roleModels.map).length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'loop.roleModels.map must have at least one entry',
+        path: ['roleModels', 'map'],
       });
     }
   });

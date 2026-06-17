@@ -21,6 +21,7 @@ import type {
   NodeConfig,
   ProviderCapabilities,
   TokenUsage,
+  IAgentProvider,
 } from '@archon/providers/types';
 import {
   getProviderCapabilities,
@@ -447,6 +448,55 @@ async function resolveNodeProviderAndModel(
     }
   }
 
+  const providerAssistantConfig = config.assistants[provider];
+  model ??=
+    provider === workflowProvider
+      ? workflowModel
+      : (providerAssistantConfig?.model as string | undefined);
+  const effectivePreset =
+    preset ?? (!node.model && provider === workflowProvider ? workflowPreset : undefined);
+
+  // Build options for the resolved provider/model pair. buildProviderOptions
+  // throws if the provider is not registered (fail-fast for the node path; the
+  // loop role-models path catches it for a descriptive per-loop error).
+  return buildProviderOptions(
+    provider,
+    model,
+    effectivePreset,
+    node,
+    config,
+    platform,
+    conversationId,
+    workflowRunId,
+    workflowLevelOptions
+  );
+}
+
+/**
+ * Build SendQueryOptions for an ALREADY-resolved (provider, model) pair.
+ *
+ * Split out of resolveNodeProviderAndModel so two callers share it: the normal
+ * node path (after model→provider spec resolution) and the loop `roleModels`
+ * path (which selects an explicit provider/model per iteration). Emits the same
+ * capability warnings and builds the same nodeConfig/assistantConfig.
+ *
+ * Throws if `provider` is not a registered provider id.
+ */
+async function buildProviderOptions(
+  provider: string,
+  model: string | undefined,
+  effectivePreset: ModelAliasPreset | undefined,
+  node: DagNode,
+  config: WorkflowConfig,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflowRunId: string,
+  workflowLevelOptions: WorkflowLevelOptions
+): Promise<{
+  provider: string;
+  model: string | undefined;
+  options: SendQueryOptions;
+}> {
   if (!isRegisteredProvider(provider)) {
     throw new Error(
       `Node '${node.id}': unknown provider '${provider}'. ` +
@@ -455,14 +505,6 @@ async function resolveNodeProviderAndModel(
           .join(', ')}`
     );
   }
-
-  const providerAssistantConfig = config.assistants[provider];
-  model ??=
-    provider === workflowProvider
-      ? workflowModel
-      : (providerAssistantConfig?.model as string | undefined);
-  const effectivePreset =
-    preset ?? (!node.model && provider === workflowProvider ? workflowPreset : undefined);
 
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
@@ -1952,6 +1994,18 @@ async function executeScriptNode(
  * - Receives upstream node outputs for $nodeId.output substitution
  * - Does not write current_step_index (DAG tracks per-node completion)
  */
+/**
+ * A loop role-model target resolved to a ready-to-use provider client plus the
+ * SendQueryOptions for its (provider, model) pair. Precomputed once per distinct
+ * target at loop start (see executeLoopNode) so per-iteration selection is cheap.
+ */
+interface ResolvedRoleModel {
+  aiClient: IAgentProvider;
+  options: SendQueryOptions | undefined;
+  provider: string;
+  model: string;
+}
+
 async function executeLoopNode(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
@@ -1967,6 +2021,7 @@ async function executeLoopNode(
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
+  workflowLevelOptions: WorkflowLevelOptions,
   issueContext?: string
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
@@ -1984,6 +2039,66 @@ async function executeLoopNode(
       'loop_node.provider_failed'
     );
     return { state: 'failed', output: '', error: errorMsg };
+  }
+
+  // Per-role model selection (adversarial "different mind"). When loop.roleModels
+  // is set, each iteration reads `field` from the JSON `stateFile` and runs on the
+  // matching provider/model instead of the single node-level one. Resolve every
+  // distinct target ONCE up front (fail fast if any provider is unconfigured) and
+  // cache its client + options, so the per-iteration cost is just a file read.
+  let roleResolvedByValue: Map<string, ResolvedRoleModel> | undefined;
+  let roleDefaultResolved: ResolvedRoleModel | undefined;
+  if (loop.roleModels) {
+    const rm = loop.roleModels;
+    const cache = new Map<string, ResolvedRoleModel>();
+    const resolveTarget = async (
+      targetProvider: string,
+      targetModel: string
+    ): Promise<ResolvedRoleModel> => {
+      const cacheKey = `${targetProvider}::${targetModel}`;
+      const cached = cache.get(cacheKey);
+      if (cached) return cached;
+      let client: ReturnType<typeof deps.getAgentProvider>;
+      try {
+        client = deps.getAgentProvider(targetProvider);
+      } catch (error) {
+        const err = error as Error;
+        throw new Error(
+          `Loop node '${node.id}' roleModels: provider '${targetProvider}' (model '${targetModel}') is not configured. Original: ${err.message}`
+        );
+      }
+      const { options } = await buildProviderOptions(
+        targetProvider,
+        targetModel,
+        undefined, // no preset — roleModels targets are explicit literal pairs
+        node,
+        config,
+        platform,
+        conversationId,
+        workflowRun.id,
+        workflowLevelOptions
+      );
+      const resolved: ResolvedRoleModel = {
+        aiClient: client,
+        options,
+        provider: targetProvider,
+        model: targetModel,
+      };
+      cache.set(cacheKey, resolved);
+      return resolved;
+    };
+
+    try {
+      roleResolvedByValue = new Map();
+      for (const [value, target] of Object.entries(rm.map)) {
+        roleResolvedByValue.set(value, await resolveTarget(target.provider, target.model));
+      }
+      roleDefaultResolved = await resolveTarget(rm.default.provider, rm.default.model);
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, nodeId: node.id }, 'loop_node.role_models_resolve_failed');
+      return { state: 'failed', output: '', error: err.message };
+    }
   }
 
   // Detect interactive loop resume — check if workflowRun.metadata has loop gate state for this node
@@ -2008,6 +2123,61 @@ async function executeLoopNode(
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
     const iterationStart = Date.now();
+
+    // Per-iteration role-model selection. Default to the single node-level
+    // client/options; when loop.roleModels is set, read the role from the state
+    // file and swap in this role's precomputed client/options (different mind).
+    let activeAiClient = aiClient;
+    let activeOptions = resolvedOptions;
+    if (loop.roleModels && roleResolvedByValue && roleDefaultResolved) {
+      const rm = loop.roleModels;
+      let roleValue = '(default)';
+      let resolved = roleDefaultResolved;
+      try {
+        // Resolve $ARTIFACTS_DIR (and other workflow vars) in the state-file path,
+        // then resolve relative paths against the run cwd.
+        const { prompt: rawStatePath } = substituteWorkflowVariables(
+          rm.stateFile,
+          workflowRun.id,
+          workflowRun.user_message,
+          artifactsDir,
+          baseBranch,
+          docsDir,
+          issueContext
+        );
+        const statePath = isAbsolute(rawStatePath) ? rawStatePath : resolvePath(cwd, rawStatePath);
+        const parsed: unknown = JSON.parse(await readFile(statePath, 'utf8'));
+        const fieldValue =
+          parsed && typeof parsed === 'object'
+            ? (parsed as Record<string, unknown>)[rm.field]
+            : undefined;
+        if (typeof fieldValue === 'string') {
+          const match = roleResolvedByValue.get(fieldValue);
+          if (match) {
+            roleValue = fieldValue;
+            resolved = match;
+          } else {
+            // Field present but no map key — fall back to default (by design).
+            roleValue = fieldValue;
+          }
+        }
+      } catch {
+        // Missing/unreadable/unparseable state file (e.g. iteration 1 before it
+        // exists) — use the default target. Not an error.
+      }
+      activeAiClient = resolved.aiClient;
+      activeOptions = resolved.options;
+      getLog().info(
+        {
+          nodeId: node.id,
+          iteration: i,
+          role: roleValue,
+          provider: resolved.provider,
+          model: resolved.model,
+        },
+        'loop_node.role_model_selected'
+      );
+    }
 
     // Check for non-running status between iterations. `paused` is tolerated
     // here for the same reason as the streaming check: a sibling approval
@@ -2088,11 +2258,16 @@ async function executeLoopNode(
       const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
       const iterationOptions: SendQueryOptions | undefined = {
-        ...resolvedOptions,
+        ...activeOptions,
         abortSignal: iterationAbortController.signal,
       };
 
-      const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+      const generator = activeAiClient.sendQuery(
+        finalPrompt,
+        cwd,
+        resumeSessionId,
+        iterationOptions
+      );
       let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
@@ -3084,6 +3259,7 @@ export async function executeDagWorkflow(
               docsDir,
               nodeOutputs,
               config,
+              workflowLevelOptions,
               issueContext
             );
             return { nodeId: node.id, output };

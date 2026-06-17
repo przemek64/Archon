@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
+import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
@@ -5198,6 +5199,322 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         >
       ).mock.calls;
       expect(pauseCalls.length).toBe(0);
+    });
+
+    // ─── roleModels (per-role model selection) ──────────────────────────────
+    describe('roleModels (per-role model selection)', () => {
+      // Config with the three providers the role map references.
+      const roleConfig: WorkflowConfig = {
+        assistant: 'claude',
+        assistants: { claude: {}, codex: {}, pi: {} },
+        commands: {},
+        defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
+      };
+
+      /**
+       * Records {provider, model} per sendQuery call. Each getAgentProvider(provider)
+       * returns a client whose sendQuery closes over `provider`, so we can assert
+       * which provider/model actually ran each iteration. `genFor(provider)` lets
+       * each test decide the stream/side-effects per provider.
+       */
+      function installRoleProviders(
+        recorded: { provider: string; model: string | undefined }[],
+        genFor: (provider: string) => (opts: { model?: string }) => Generator<unknown>
+      ): void {
+        mockGetAgentProviderDag.mockImplementation((provider: string) => ({
+          sendQuery: mock(function* (
+            _prompt: string,
+            _cwd: string,
+            _resume: string | undefined,
+            opts: { model?: string }
+          ) {
+            recorded.push({ provider, model: opts?.model });
+            yield* genFor(provider)(opts);
+          }),
+          getType: () => provider,
+          getCapabilities: mockClaudeCapabilities,
+        }));
+      }
+
+      const stateFilePathFor = (dir: string): string => join(dir, 'artifacts', 'impl-state.json');
+
+      it('absent roleModels -> single provider/model used every iteration (regression)', async () => {
+        const recorded: { provider: string; model: string | undefined }[] = [];
+        let call = 0;
+        installRoleProviders(
+          recorded,
+          () => () =>
+            (function* () {
+              call++;
+              if (call < 2) {
+                yield { type: 'assistant', content: 'working' };
+                yield { type: 'result', sessionId: 's' };
+              } else {
+                yield { type: 'assistant', content: 'done <promise>COMPLETE</promise>' };
+                yield { type: 'result', sessionId: 's' };
+              }
+            })()
+        );
+
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-loop-no-rolemodels',
+            nodes: [
+              {
+                id: 'loop',
+                loop: { prompt: 'do it', until: 'COMPLETE', max_iterations: 5 },
+              },
+            ],
+          },
+          makeWorkflowRun(),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          roleConfig
+        );
+
+        expect(recorded.length).toBe(2);
+        expect(recorded.every(r => r.provider === 'claude')).toBe(true);
+      });
+
+      it('alternating building/evaluating state -> generator and evaluator on different providers', async () => {
+        const recorded: { provider: string; model: string | undefined }[] = [];
+        await mkdir(join(testDir, 'artifacts'), { recursive: true });
+        const statePath = stateFilePathFor(testDir);
+        // Seed: iteration 1 reads phase=building (generator on codex).
+        writeFileSync(statePath, JSON.stringify({ phase: 'building' }));
+
+        installRoleProviders(
+          recorded,
+          provider => () =>
+            (function* () {
+              if (provider === 'codex') {
+                // Generator finishes a pass → flip phase to evaluating, no completion.
+                writeFileSync(statePath, JSON.stringify({ phase: 'evaluating' }));
+                yield { type: 'assistant', content: 'built something' };
+                yield { type: 'result', sessionId: 's' };
+              } else {
+                // Evaluator (pi) signals completion.
+                yield { type: 'assistant', content: 'graded it <promise>COMPLETE</promise>' };
+                yield { type: 'result', sessionId: 's' };
+              }
+            })()
+        );
+
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-loop-rolemodels-alt',
+            nodes: [
+              {
+                id: 'adv-loop',
+                loop: {
+                  prompt: 'adversarial step',
+                  until: 'COMPLETE',
+                  max_iterations: 10,
+                  fresh_context: true,
+                  roleModels: {
+                    stateFile: '$ARTIFACTS_DIR/impl-state.json',
+                    field: 'phase',
+                    map: {
+                      building: { provider: 'codex', model: 'gpt-5.5' },
+                      evaluating: { provider: 'pi', model: 'kimi-coding/kimi-for-coding' },
+                    },
+                    default: { provider: 'claude', model: 'sonnet' },
+                  },
+                },
+              },
+            ],
+          },
+          makeWorkflowRun(),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          roleConfig
+        );
+
+        expect(recorded).toEqual([
+          { provider: 'codex', model: 'gpt-5.5' },
+          { provider: 'pi', model: 'kimi-coding/kimi-for-coding' },
+        ]);
+      });
+
+      it('state file missing on iteration 1 -> uses default target', async () => {
+        const recorded: { provider: string; model: string | undefined }[] = [];
+        // Do NOT create the state file — iteration 1 must fall back to default.
+        installRoleProviders(
+          recorded,
+          () => () =>
+            (function* () {
+              yield { type: 'assistant', content: 'done <promise>COMPLETE</promise>' };
+              yield { type: 'result', sessionId: 's' };
+            })()
+        );
+
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-loop-rolemodels-missing',
+            nodes: [
+              {
+                id: 'adv-loop',
+                loop: {
+                  prompt: 'adversarial step',
+                  until: 'COMPLETE',
+                  max_iterations: 5,
+                  roleModels: {
+                    stateFile: '$ARTIFACTS_DIR/impl-state.json',
+                    field: 'phase',
+                    map: {
+                      building: { provider: 'codex', model: 'gpt-5.5' },
+                      evaluating: { provider: 'pi', model: 'kimi' },
+                    },
+                    default: { provider: 'claude', model: 'sonnet' },
+                  },
+                },
+              },
+            ],
+          },
+          makeWorkflowRun(),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          roleConfig
+        );
+
+        expect(recorded.length).toBe(1);
+        expect(recorded[0]).toEqual({ provider: 'claude', model: 'sonnet' });
+      });
+
+      it('field value not in map -> uses default target', async () => {
+        const recorded: { provider: string; model: string | undefined }[] = [];
+        await mkdir(join(testDir, 'artifacts'), { recursive: true });
+        writeFileSync(stateFilePathFor(testDir), JSON.stringify({ phase: 'mystery' }));
+
+        installRoleProviders(
+          recorded,
+          () => () =>
+            (function* () {
+              yield { type: 'assistant', content: 'done <promise>COMPLETE</promise>' };
+              yield { type: 'result', sessionId: 's' };
+            })()
+        );
+
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-loop-rolemodels-nomatch',
+            nodes: [
+              {
+                id: 'adv-loop',
+                loop: {
+                  prompt: 'adversarial step',
+                  until: 'COMPLETE',
+                  max_iterations: 5,
+                  roleModels: {
+                    stateFile: '$ARTIFACTS_DIR/impl-state.json',
+                    field: 'phase',
+                    map: {
+                      building: { provider: 'codex', model: 'gpt-5.5' },
+                      evaluating: { provider: 'pi', model: 'kimi' },
+                    },
+                    default: { provider: 'claude', model: 'sonnet' },
+                  },
+                },
+              },
+            ],
+          },
+          makeWorkflowRun(),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          roleConfig
+        );
+
+        expect(recorded.length).toBe(1);
+        expect(recorded[0]).toEqual({ provider: 'claude', model: 'sonnet' });
+      });
+
+      it('unknown provider in map -> fail fast before first iteration', async () => {
+        const recorded: { provider: string; model: string | undefined }[] = [];
+        installRoleProviders(
+          recorded,
+          () => () =>
+            (function* () {
+              yield { type: 'assistant', content: 'should never run <promise>COMPLETE</promise>' };
+              yield { type: 'result', sessionId: 's' };
+            })()
+        );
+
+        const mockDeps = createMockDeps();
+        await executeDagWorkflow(
+          mockDeps,
+          createMockPlatform(),
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-loop-rolemodels-badprovider',
+            nodes: [
+              {
+                id: 'adv-loop',
+                loop: {
+                  prompt: 'adversarial step',
+                  until: 'COMPLETE',
+                  max_iterations: 5,
+                  roleModels: {
+                    stateFile: '$ARTIFACTS_DIR/impl-state.json',
+                    field: 'phase',
+                    map: {
+                      building: { provider: 'nonexistent-provider', model: 'x' },
+                    },
+                    default: { provider: 'claude', model: 'sonnet' },
+                  },
+                },
+              },
+            ],
+          },
+          makeWorkflowRun(),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          roleConfig
+        );
+
+        // No iteration should have run, and the run must be marked failed.
+        expect(recorded.length).toBe(0);
+        expect(
+          (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>)
+            .mock.calls.length
+        ).toBe(1);
+      });
     });
   });
 });

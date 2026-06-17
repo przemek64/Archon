@@ -13,8 +13,8 @@ export { stepRetryConfigSchema } from './retry';
 export type { StepRetryConfig } from './retry';
 
 // Loop node configuration
-export { loopNodeConfigSchema } from './loop';
-export type { LoopNodeConfig } from './loop';
+export { loopNodeConfigSchema, roleModelsSchema, roleModelTargetSchema } from './loop';
+export type { LoopNodeConfig, RoleModels, RoleModelTarget } from './loop';
 
 // Hooks
 export {
