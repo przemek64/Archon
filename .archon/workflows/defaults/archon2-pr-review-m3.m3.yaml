@@ -69,8 +69,9 @@ nodes:
 
         ## Pick your file
         ```bash
-        comm -23 <(sort -u "$ARTIFACTS_DIR/review/files.txt") <(sort -u "$ARTIFACTS_DIR/review/reviewed.txt") | head -1
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
         ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
         If EMPTY -> output `<promise>REVIEW_DONE</promise>` and stop. Else let FILE be that path.
 
         ## Context (read only what you need for FILE)
@@ -153,8 +154,9 @@ nodes:
 
         ## Pick your file
         ```bash
-        comm -23 <(sort -u "$ARTIFACTS_DIR/review/files.txt") <(sort -u "$ARTIFACTS_DIR/review/audited.txt") | head -1
+        grep -vxF -f "$ARTIFACTS_DIR/review/audited.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
         ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
         If EMPTY -> output `<promise>AUDIT_DONE</promise>` and stop. Else let FILE be that path.
 
         ## Read
@@ -223,8 +225,9 @@ nodes:
 
         ## Pick your file (next file in files.txt not yet in audited.txt)
         ```bash
-        comm -23 <(sort -u "$ARTIFACTS_DIR/review/files.txt") <(sort -u "$ARTIFACTS_DIR/review/audited.txt") | head -1
+        grep -vxF -f "$ARTIFACTS_DIR/review/audited.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
         ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
         If EMPTY -> output `<promise>AUDIT_DONE</promise>` and stop. Else let FILE be that path.
 
         ## Read

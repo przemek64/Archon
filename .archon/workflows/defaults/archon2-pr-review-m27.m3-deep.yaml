@@ -70,8 +70,9 @@ nodes:
         ## Pick your file
         Compute the next file to review (first line of files.txt not yet in reviewed.txt):
         ```bash
-        comm -23 <(sort -u "$ARTIFACTS_DIR/review/files.txt") <(sort -u "$ARTIFACTS_DIR/review/reviewed.txt") | head -1
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
         ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
         If that is EMPTY, every file is done — output `<promise>DEEP_DONE</promise>` and stop.
         Otherwise let FILE be that path.
 
