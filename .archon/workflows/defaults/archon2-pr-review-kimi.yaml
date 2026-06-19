@@ -1,0 +1,62 @@
+name: archon2-pr-review-kimi
+description: |
+  Use when: User wants a comprehensive code review of a pull request with automatic fixes,
+  running the review agents on Kimi instead of codex/gpt-5.4 (A/B reviewer test variant).
+  Triggers: "review this PR with kimi", "comprehensive review kimi", "kimi PR review".
+  Does: Syncs PR with main (rebase if needed) -> runs 5 specialized review agents in parallel ->
+        synthesizes findings -> auto-fixes CRITICAL/HIGH issues -> reports remaining issues.
+  NOT for: Quick questions about a PR, checking CI status, simple "what changed" queries.
+
+  This workflow produces artifacts in $ARTIFACTS_DIR/../reviews/pr-{number}/ and posts
+  a comprehensive review comment to the GitHub PR.
+
+provider: pi
+model: minimax/MiniMax-M2.7
+nodes:
+  - id: scope
+    command: archon-pr-review-scope
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [scope]
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [sync]
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [sync]
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [sync]
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [sync]
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [sync]
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+
+  - id: implement-fixes
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]

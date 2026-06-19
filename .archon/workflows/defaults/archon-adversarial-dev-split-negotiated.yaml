@@ -1,0 +1,3348 @@
+name: archon-adversarial-dev-split-negotiated
+description: |
+  Use when: build an app adversarially with SPLIT providers — Codex builds, Opus reviews.
+    Triggers: "negotiated adversarial", "adversarial split negotiated".
+    Unrolled DAG (8 sprints x 3 rounds). Each sprint negotiates its own contract (codex).
+    Codex generates, Opus evaluates each round. Hard-fails when rounds or sprints are exhausted.
+    NOT for: bug fixes, PR reviews, refactors, simple tasks.
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  - id: seed-workspace
+    timeout: 120000
+    bash: |
+      set -euo pipefail
+      ARTIFACTS="$ARTIFACTS_DIR"
+      mkdir -p "$ARTIFACTS/contracts" "$ARTIFACTS/feedback" "$ARTIFACTS/app"
+
+      # Resolve the repo from the node's REAL cwd. Do NOT use $PWD — the executor spreads
+      # the server's process.env (incl. a stale PWD pointing at the Archon repo) into bash,
+      # so $PWD lies. `git rev-parse --show-toplevel` uses getcwd(), which is correct.
+      REPO=$(git rev-parse --show-toplevel 2>/dev/null || true)
+      if [ -z "$REPO" ]; then
+        echo "FATAL: node cwd is not inside a git repo — cannot seed app/" >&2
+        exit 1
+      fi
+      echo "Repo (from getcwd): $REPO" >&2
+
+      SEED_REF=$(printf '%s' "$ARGUMENTS" | grep -oE '\[seed:[^]]+\]' | head -1 | sed -E 's/\[seed:(.*)\]/\1/' || true)
+      SEED_REF="${SEED_REF:-HEAD}"
+      # If the ref isn't resolvable locally, try fetching it (commits/tags resolve from the shared object store).
+      if ! git -C "$REPO" rev-parse --verify -q "$SEED_REF^{commit}" >/dev/null; then
+        git -C "$REPO" fetch -q origin "$SEED_REF" 2>/dev/null || true
+        if git -C "$REPO" rev-parse --verify -q "origin/$SEED_REF^{commit}" >/dev/null; then SEED_REF="origin/$SEED_REF"; fi
+      fi
+      if ! git -C "$REPO" rev-parse --verify -q "$SEED_REF^{commit}" >/dev/null; then
+        echo "FATAL: seed ref '$SEED_REF' not found in $REPO" >&2
+        exit 1
+      fi
+      echo "Seeding app/ from $(git -C "$REPO" rev-parse --short "$SEED_REF") ($SEED_REF)" >&2
+      # Extract INSIDE app/ (cd first, read from stdin) — do NOT use `tar -C <winpath>`:
+      # MSYS tar mis-parses a Windows-drive -C arg as host:path and fails ("Cannot open").
+      cd "$ARTIFACTS/app"
+      git -C "$REPO" archive "$SEED_REF" | tar -xf -
+
+      # Fail loudly if the seed produced nothing (catches archive/tar problems instead of
+      # silently committing an empty baseline). Counted relative — .git not created yet.
+      FILE_COUNT=$(find . -type f | wc -l | tr -d ' ')
+      if [ "$FILE_COUNT" -eq 0 ]; then
+        echo "FATAL: seed extracted 0 files from $SEED_REF — aborting" >&2
+        exit 1
+      fi
+      echo "Seeded $FILE_COUNT files into app/" >&2
+
+      git init -q
+      git add -A
+      git -c user.email=archon@local -c user.name=archon \
+        commit -q -m "Baseline: existing codebase (read-only prerequisites)"
+
+      echo "{\"appDir\": \"$ARTIFACTS/app\", \"seededFiles\": $FILE_COUNT}"
+
+  - id: plan
+    depends_on: [seed-workspace]
+    provider: claude
+    model: opus
+    prompt: |
+      You are a software architect. Your job is to take a short user prompt and plan a NEW,
+      self-contained module that is added on top of an EXISTING codebase.
+
+      ## User Request
+
+      $ARGUMENTS
+
+      ## Existing Codebase
+
+      The existing project has been copied (read-only reference) into `$ARTIFACTS_DIR/app/`.
+      Before writing anything, EXPLORE it with Glob/Grep/Read:
+      - Understand the tech stack, conventions, and directory layout actually in use.
+      - Identify the PREREQUISITES the new module depends on: the specific existing files,
+        exported functions/classes, APIs, types, config, or data the module will consume.
+        List them by concrete path — do not guess.
+      - Decide where the new module's files will live (a new, clearly-scoped subdirectory).
+
+      ## Your Task
+
+      Write a comprehensive module specification to `$ARTIFACTS_DIR/spec.md` using the Write tool.
+
+      The spec MUST include ALL of the following sections:
+
+      ### 1. Module Overview
+      What the new module does, who/what consumes it, why it's needed.
+
+      ### 2. Tech Stack
+      Match the EXISTING codebase's stack and conventions. Be specific.
+
+      ### 3. Prerequisites (existing code this module depends on)
+      List each prerequisite by concrete path under `$ARTIFACTS_DIR/app/`, what it provides,
+      and how the module uses it. This is the contract with the existing code.
+
+      ### 4. Module Surface & Design
+      The new files to be created (paths), the public interface the module exposes, data
+      flow, and how consumers wire it in WITHOUT the module editing existing files.
+
+      ### 5. Feature List
+      Every feature of the module, organized by priority. Be exhaustive.
+
+      ### 6. Sprint Plan
+      Module work broken into UP TO 8 sprints, ordered by dependency.
+      - **Sprint 1** establishes the module's skeleton (new files, interfaces, stubs that
+        compile/import cleanly against the prerequisites) — NOT project-wide scaffolding.
+      - Each subsequent sprint builds on the previous.
+      - Label each clearly: "Sprint 1: ...", "Sprint 2: ...", up to at most Sprint 8.
+
+      CRITICAL: this is a STRICTLY-ADDITIVE module. Every sprint creates NEW files only.
+      Existing files in `$ARTIFACTS_DIR/app/` are read-only prerequisites — never modified.
+
+      Be specific and opinionated. Write the spec to `$ARTIFACTS_DIR/spec.md` using the Write tool.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: init-workspace
+    depends_on: [plan]
+    timeout: 30000
+    bash: |
+      ARTIFACTS="$ARTIFACTS_DIR"
+      SPEC="$ARTIFACTS/spec.md"
+      SPRINT_COUNT=3
+      if [ -f "$SPEC" ]; then
+        FOUND=$(grep -ioE 'sprint\s+[0-9]+' "$SPEC" | grep -oE '[0-9]+' | sort -n | tail -1)
+        if [ -n "$FOUND" ] && [ "$FOUND" -ge 1 ] 2>/dev/null; then SPRINT_COUNT=$FOUND; fi
+      fi
+      # Hard ceiling: this workflow is unrolled to 8 sprints only.
+      if [ "$SPRINT_COUNT" -gt 8 ]; then SPRINT_COUNT=8; fi
+
+      cat > "$ARTIFACTS/state.json" << STATEEOF
+      {
+        "phase": "negotiating",
+        "sprint": 1,
+        "totalSprints": $SPRINT_COUNT,
+        "retry": 0,
+        "maxRetries": 3,
+        "passThreshold": 7,
+        "completedSprints": [],
+        "status": "running"
+      }
+      STATEEOF
+
+      echo "{\"totalSprints\": $SPRINT_COUNT, \"appDir\": \"$ARTIFACTS/app\"}"
+
+  - id: gate-negotiate-1
+    depends_on: [init-workspace]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 1 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-1
+    depends_on: [gate-negotiate-1]
+    trigger_rule: all_done
+    when: "$gate-negotiate-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-1-1
+    depends_on: [negotiate-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 1 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-1-1
+    depends_on: [gate-gen-1-1]
+    trigger_rule: all_done
+    when: "$gate-gen-1-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-1-1
+    depends_on: [generate-1-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 1 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-1-1
+    depends_on: [gate-eval-1-1]
+    trigger_rule: all_done
+    when: "$gate-eval-1-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-1-2
+    depends_on: [evaluate-1-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 1 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-1-2
+    depends_on: [gate-gen-1-2]
+    trigger_rule: all_done
+    when: "$gate-gen-1-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-1-2
+    depends_on: [generate-1-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 1 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-1-2
+    depends_on: [gate-eval-1-2]
+    trigger_rule: all_done
+    when: "$gate-eval-1-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-1-3
+    depends_on: [evaluate-1-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 1 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-1-3
+    depends_on: [gate-gen-1-3]
+    trigger_rule: all_done
+    when: "$gate-gen-1-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-1-3
+    depends_on: [generate-1-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 1 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-1-3
+    depends_on: [gate-eval-1-3]
+    trigger_rule: all_done
+    when: "$gate-eval-1-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-negotiate-2
+    depends_on: [evaluate-1-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 2 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-2
+    depends_on: [gate-negotiate-2]
+    trigger_rule: all_done
+    when: "$gate-negotiate-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-2-1
+    depends_on: [negotiate-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 2 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-2-1
+    depends_on: [gate-gen-2-1]
+    trigger_rule: all_done
+    when: "$gate-gen-2-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-2-1
+    depends_on: [generate-2-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 2 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-2-1
+    depends_on: [gate-eval-2-1]
+    trigger_rule: all_done
+    when: "$gate-eval-2-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-2-2
+    depends_on: [evaluate-2-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 2 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-2-2
+    depends_on: [gate-gen-2-2]
+    trigger_rule: all_done
+    when: "$gate-gen-2-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-2-2
+    depends_on: [generate-2-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 2 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-2-2
+    depends_on: [gate-eval-2-2]
+    trigger_rule: all_done
+    when: "$gate-eval-2-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-2-3
+    depends_on: [evaluate-2-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 2 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-2-3
+    depends_on: [gate-gen-2-3]
+    trigger_rule: all_done
+    when: "$gate-gen-2-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-2-3
+    depends_on: [generate-2-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 2 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-2-3
+    depends_on: [gate-eval-2-3]
+    trigger_rule: all_done
+    when: "$gate-eval-2-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-negotiate-3
+    depends_on: [evaluate-2-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 3 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-3
+    depends_on: [gate-negotiate-3]
+    trigger_rule: all_done
+    when: "$gate-negotiate-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-3-1
+    depends_on: [negotiate-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 3 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-3-1
+    depends_on: [gate-gen-3-1]
+    trigger_rule: all_done
+    when: "$gate-gen-3-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-3-1
+    depends_on: [generate-3-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 3 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-3-1
+    depends_on: [gate-eval-3-1]
+    trigger_rule: all_done
+    when: "$gate-eval-3-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-3-2
+    depends_on: [evaluate-3-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 3 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-3-2
+    depends_on: [gate-gen-3-2]
+    trigger_rule: all_done
+    when: "$gate-gen-3-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-3-2
+    depends_on: [generate-3-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 3 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-3-2
+    depends_on: [gate-eval-3-2]
+    trigger_rule: all_done
+    when: "$gate-eval-3-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-3-3
+    depends_on: [evaluate-3-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 3 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-3-3
+    depends_on: [gate-gen-3-3]
+    trigger_rule: all_done
+    when: "$gate-gen-3-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-3-3
+    depends_on: [generate-3-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 3 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-3-3
+    depends_on: [gate-eval-3-3]
+    trigger_rule: all_done
+    when: "$gate-eval-3-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-negotiate-4
+    depends_on: [evaluate-3-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 4 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-4
+    depends_on: [gate-negotiate-4]
+    trigger_rule: all_done
+    when: "$gate-negotiate-4.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-4-1
+    depends_on: [negotiate-4]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 4 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-4-1
+    depends_on: [gate-gen-4-1]
+    trigger_rule: all_done
+    when: "$gate-gen-4-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-4-1
+    depends_on: [generate-4-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 4 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-4-1
+    depends_on: [gate-eval-4-1]
+    trigger_rule: all_done
+    when: "$gate-eval-4-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-4-2
+    depends_on: [evaluate-4-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 4 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-4-2
+    depends_on: [gate-gen-4-2]
+    trigger_rule: all_done
+    when: "$gate-gen-4-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-4-2
+    depends_on: [generate-4-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 4 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-4-2
+    depends_on: [gate-eval-4-2]
+    trigger_rule: all_done
+    when: "$gate-eval-4-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-4-3
+    depends_on: [evaluate-4-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 4 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-4-3
+    depends_on: [gate-gen-4-3]
+    trigger_rule: all_done
+    when: "$gate-gen-4-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-4-3
+    depends_on: [generate-4-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 4 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-4-3
+    depends_on: [gate-eval-4-3]
+    trigger_rule: all_done
+    when: "$gate-eval-4-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-negotiate-5
+    depends_on: [evaluate-4-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 5 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-5
+    depends_on: [gate-negotiate-5]
+    trigger_rule: all_done
+    when: "$gate-negotiate-5.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-5-1
+    depends_on: [negotiate-5]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 5 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-5-1
+    depends_on: [gate-gen-5-1]
+    trigger_rule: all_done
+    when: "$gate-gen-5-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-5-1
+    depends_on: [generate-5-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 5 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-5-1
+    depends_on: [gate-eval-5-1]
+    trigger_rule: all_done
+    when: "$gate-eval-5-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-5-2
+    depends_on: [evaluate-5-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 5 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-5-2
+    depends_on: [gate-gen-5-2]
+    trigger_rule: all_done
+    when: "$gate-gen-5-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-5-2
+    depends_on: [generate-5-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 5 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-5-2
+    depends_on: [gate-eval-5-2]
+    trigger_rule: all_done
+    when: "$gate-eval-5-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-5-3
+    depends_on: [evaluate-5-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 5 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-5-3
+    depends_on: [gate-gen-5-3]
+    trigger_rule: all_done
+    when: "$gate-gen-5-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-5-3
+    depends_on: [generate-5-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 5 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-5-3
+    depends_on: [gate-eval-5-3]
+    trigger_rule: all_done
+    when: "$gate-eval-5-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-negotiate-6
+    depends_on: [evaluate-5-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 6 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-6
+    depends_on: [gate-negotiate-6]
+    trigger_rule: all_done
+    when: "$gate-negotiate-6.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-6-1
+    depends_on: [negotiate-6]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 6 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-6-1
+    depends_on: [gate-gen-6-1]
+    trigger_rule: all_done
+    when: "$gate-gen-6-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-6-1
+    depends_on: [generate-6-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 6 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-6-1
+    depends_on: [gate-eval-6-1]
+    trigger_rule: all_done
+    when: "$gate-eval-6-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-6-2
+    depends_on: [evaluate-6-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 6 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-6-2
+    depends_on: [gate-gen-6-2]
+    trigger_rule: all_done
+    when: "$gate-gen-6-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-6-2
+    depends_on: [generate-6-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 6 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-6-2
+    depends_on: [gate-eval-6-2]
+    trigger_rule: all_done
+    when: "$gate-eval-6-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-6-3
+    depends_on: [evaluate-6-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 6 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-6-3
+    depends_on: [gate-gen-6-3]
+    trigger_rule: all_done
+    when: "$gate-gen-6-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-6-3
+    depends_on: [generate-6-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 6 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-6-3
+    depends_on: [gate-eval-6-3]
+    trigger_rule: all_done
+    when: "$gate-eval-6-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-negotiate-7
+    depends_on: [evaluate-6-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 7 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-7
+    depends_on: [gate-negotiate-7]
+    trigger_rule: all_done
+    when: "$gate-negotiate-7.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-7-1
+    depends_on: [negotiate-7]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 7 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-7-1
+    depends_on: [gate-gen-7-1]
+    trigger_rule: all_done
+    when: "$gate-gen-7-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-7-1
+    depends_on: [generate-7-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 7 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-7-1
+    depends_on: [gate-eval-7-1]
+    trigger_rule: all_done
+    when: "$gate-eval-7-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-7-2
+    depends_on: [evaluate-7-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 7 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-7-2
+    depends_on: [gate-gen-7-2]
+    trigger_rule: all_done
+    when: "$gate-gen-7-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-7-2
+    depends_on: [generate-7-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 7 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-7-2
+    depends_on: [gate-eval-7-2]
+    trigger_rule: all_done
+    when: "$gate-eval-7-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-7-3
+    depends_on: [evaluate-7-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 7 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-7-3
+    depends_on: [gate-gen-7-3]
+    trigger_rule: all_done
+    when: "$gate-gen-7-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-7-3
+    depends_on: [generate-7-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 7 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-7-3
+    depends_on: [gate-eval-7-3]
+    trigger_rule: all_done
+    when: "$gate-eval-7-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-negotiate-8
+    depends_on: [evaluate-7-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 8 ] && [ "$PHASE" = negotiating ]; then printf yes; else printf no; fi
+
+  - id: negotiate-8
+    depends_on: [gate-negotiate-8]
+    trigger_rule: all_done
+    when: "$gate-negotiate-8.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    prompt: |
+      # Contract Negotiator
+
+      Read `$ARTIFACTS_DIR/state.json` for `sprint` (= N) and `$ARTIFACTS_DIR/spec.md` for product context.
+
+      You negotiate the success criteria for Sprint {N}. Play BOTH sides sequentially:
+
+      **Step 1 — Generator's Proposal:** Identify what Sprint {N} should deliver from the sprint plan.
+      Propose 5-15 specific, testable criteria. GOOD: "GET /api/tasks returns 200 with JSON array; each
+      item has id (number), title (string), status (string)". BAD: "The API works well".
+
+      **Step 2 — Evaluator's Tightening:** Review your proposal as an adversary. For EACH criterion: is it
+      specific enough to test programmatically? What edge cases are missing? Is the bar high enough?
+      Tighten vague criteria, add edge cases, raise the bar.
+
+      **Write the final contract** to `$ARTIFACTS_DIR/contracts/sprint-{N}.json`:
+      ```json
+      {
+        "sprintNumber": <N>,
+        "features": ["feature1", "feature2"],
+        "criteria": [
+          { "name": "short-kebab-name", "description": "Specific, testable", "threshold": 7 }
+        ]
+      }
+      ```
+
+      **Update state.json**: set `"phase": "building"`. Keep all other fields unchanged.
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  - id: gate-gen-8-1
+    depends_on: [negotiate-8]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 8 ] && [ "$PHASE" = building ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: generate-8-1
+    depends_on: [gate-gen-8-1]
+    trigger_rule: all_done
+    when: "$gate-gen-8-1.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-8-1
+    depends_on: [generate-8-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 8 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 0 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-8-1
+    depends_on: [gate-eval-8-1]
+    trigger_rule: all_done
+    when: "$gate-eval-8-1.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-8-2
+    depends_on: [evaluate-8-1]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 8 ] && [ "$PHASE" = building ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: generate-8-2
+    depends_on: [gate-gen-8-2]
+    trigger_rule: all_done
+    when: "$gate-gen-8-2.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-8-2
+    depends_on: [generate-8-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 8 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 1 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-8-2
+    depends_on: [gate-eval-8-2]
+    trigger_rule: all_done
+    when: "$gate-eval-8-2.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: gate-gen-8-3
+    depends_on: [evaluate-8-2]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 8 ] && [ "$PHASE" = building ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: generate-8-3
+    depends_on: [gate-gen-8-3]
+    trigger_rule: all_done
+    when: "$gate-gen-8-3.output == 'yes'"
+    provider: codex
+    model: gpt-5.5
+    idle_timeout: 600000
+    prompt: |
+      # Generator (Codex)
+
+      You are a software engineer. Build features that MUST survive an adversarial evaluator who will
+      actively try to break your code.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N) and `retry` (=R).
+
+      **Read these files:**
+      1. `$ARTIFACTS_DIR/spec.md` — module spec (overview, prerequisites, module surface, features)
+      2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json` — the contract you must satisfy
+      3. The **Prerequisites** section of the spec — read those existing files under
+         `$ARTIFACTS_DIR/app/` to learn the APIs/types/exports your module depends on.
+      4. If `retry` > 0: read `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json` for prior feedback
+
+      **If this is a RETRY (retry > 0):** Read the feedback CAREFULLY. Every failed criterion must be
+      addressed. If scores were close (5-6) and trending up: REFINE. If low (1-4) or fundamentally broken:
+      PIVOT. Address EVERY feedback item — the evaluator WILL re-check.
+
+      **Build rules:**
+      - You are building a NEW, self-contained module inside the existing codebase at `$ARTIFACTS_DIR/app/`.
+      - STRICTLY NEW FILES ONLY. Create your module's own files (in the subdirectory named in the spec).
+        NEVER modify, rename, or delete any file that was part of the existing codebase — they are
+        read-only prerequisites. If you think an existing file must change to integrate, do NOT change it;
+        instead document the required integration in your module (e.g. a README/usage note) and design the
+        module so a consumer wires it in. Verify before committing: `git diff --name-only HEAD~0` style —
+        run `git status --porcelain` and confirm only NEW (`??`/added) paths in your module dir appear.
+      - Build ONE feature at a time, verify it works, then commit:
+        `cd $ARTIFACTS_DIR/app && git add <your-new-files> && git commit -m "feat: ..."` (never `git add -A`
+        of pre-existing files; only stage files you created).
+      - Install dependencies as needed. Test your code — import the module, run it, exercise its surface.
+      - Build defensively — the evaluator's job is to break you (edge cases, error handling, validation).
+
+      **Update state.json**: set `"phase": "evaluating"`. Keep all other fields unchanged.
+
+  - id: gate-eval-8-3
+    depends_on: [generate-8-3]
+    trigger_rule: all_done
+    bash: |
+      S="$ARTIFACTS_DIR/state.json"
+      STATUS=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      SPRINT=$(sed -nE 's/.*"sprint"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      PHASE=$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$S" | head -1)
+      RETRY=$(sed -nE 's/.*"retry"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$S" | head -1)
+      if [ "$STATUS" = running ] && [ "$SPRINT" = 8 ] && [ "$PHASE" = evaluating ] && [ "$RETRY" = 2 ]; then printf yes; else printf no; fi
+
+  - id: evaluate-8-3
+    depends_on: [gate-eval-8-3]
+    trigger_rule: all_done
+    when: "$gate-eval-8-3.output == 'yes'"
+    provider: claude
+    model: opus
+    idle_timeout: 600000
+    prompt: |
+      # Evaluator (Opus) — ADVERSARIAL QA
+
+      Your mandate is to BREAK what the generator built. You are not helpful, not generous. You are an attacker.
+
+      **Read state**: `$ARTIFACTS_DIR/state.json` for `sprint` (=N), `retry` (=R), `maxRetries`, `passThreshold`.
+
+      **CRITICAL CONSTRAINTS:**
+      - READ-ONLY for source code. NEVER Write/Edit files in `$ARTIFACTS_DIR/app/`.
+      - You MAY use Bash to run the app, curl endpoints, run tests.
+      - Kill any background processes you start BEFORE finishing:
+        `pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true`
+      - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/sprint-{N}.json`. No skipping.
+
+      **Scoring:** 9-10 exceptional (handles edge cases); 7-8 solid (meets criterion); 5-6 partial (bugs/edge
+      fails); 3-4 weak; 1-2 broken. Do NOT grade on a curve. Do NOT give benefit of the doubt.
+
+      **For each criterion:** read the code, run the app, try to BREAK it (invalid inputs, missing fields,
+      edge cases), score honestly.
+
+      **Write evaluation** to `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`:
+      ```json
+      {
+        "passed": <true if ALL scores >= passThreshold>,
+        "scores": { "criterion-name": <score> },
+        "feedback": [ { "criterion": "name", "score": <1-10>,
+                        "details": "file paths, line numbers, exact errors, failing curl commands" } ],
+        "overallSummary": "What worked, what didn't, what the generator must fix."
+      }
+      ```
+
+      **`passed` is true ONLY if every score >= passThreshold.**
+
+      **Update state.json based on result:**
+
+      **If PASSED:**
+      - Add current sprint number to `completedSprints`
+      - If `sprint` < `totalSprints`: set `"phase": "negotiating"`, increment `"sprint"` by 1, set `"retry": 0`
+      - If `sprint` == `totalSprints`: set `"phase": "complete"`, set `"status": "complete"`
+
+      **If FAILED:**
+      - If `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1
+      - If `retry` >= `maxRetries`: set `"phase": "failed"`, set `"status": "failed"`
+
+      Kill all background processes before finishing.
+
+  - id: report
+    depends_on: [evaluate-8-3]
+    trigger_rule: all_done
+    prompt: |
+      You are a project reporter. Generate a comprehensive summary of the adversarial development run.
+
+      ## Read ALL of these files:
+      1. `$ARTIFACTS_DIR/state.json` — final state (success/failure, sprint count)
+      2. `$ARTIFACTS_DIR/spec.md` — the original product spec
+      3. All files in `$ARTIFACTS_DIR/contracts/` (use Glob)
+      4. All files in `$ARTIFACTS_DIR/feedback/` (use Glob)
+
+      ## Report:
+      ### Build Summary
+      - What was built, final status (all sprints passed or failed on which sprint), sprints completed vs planned.
+      ### Per-Sprint Breakdown
+      - Per attempted sprint: contract requirements, attempts (rounds), final scores, key driving feedback.
+      ### Quality Metrics
+      - Average final-round score, which criteria needed the most rounds.
+      ### How to Run
+      - Code lives in `$ARTIFACTS_DIR/app/`. Tech stack + start steps from the spec.
+
+      Write the report to `$ARTIFACTS_DIR/report.md` AND output it as your response.
+    allowed_tools: [Read, Write, Glob, Grep]

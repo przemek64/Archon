@@ -1,0 +1,86 @@
+name: archon2-pr-review-m27.m3
+description: |
+  Use when: User wants a comprehensive code review of a pull request with automatic fixes,
+  run cheaply on MiniMax with an adversarial coverage audit by a stronger different mind.
+  Triggers: "review this PR m27.m3", "adversarial pr review", "minimax adversarial review".
+  Does: Syncs PR with main -> runs 5 review agents SEQUENTIALLY on MiniMax-M2.7 ->
+        synthesizes findings (M2.7) -> ADVERSARIAL COVERAGE AUDIT on MiniMax-M3 hunts for
+        what the first pass missed and injects net-new CRITICAL/HIGH into the fix queue ->
+        auto-fixes CRITICAL/HIGH (M2.7) -> reports.
+  NOT for: Quick questions about a PR, checking CI status, simple "what changed" queries.
+
+  ARCHON2 ADVERSARIAL-REVIEW VARIANT (naming: see .archon/workflows/NAMING.md).
+  Experiment: can a cheap model (MiniMax-M2.7) be made trustworthy on the review surface by
+  adding a DIFFERENT-MIND adversarial coverage audit? The first-pass reviewers + synthesize
+  run on M2.7 (cheap, known to UNDER-DETECT). A single adversarial auditor then runs on
+  MiniMax-M3 (stronger reasoning, different mind) whose only job is to find issues the first
+  pass MISSED and inject them into the consolidated review for the fixer. Cross-model on
+  purpose: the auditor does not share M2.7's blind spots.
+
+  SEQUENTIAL by design: the 5 review agents run one-by-one (not in parallel) to avoid the
+  provider concurrency/timeout pressure that bit M3 in parallel fix loops.
+
+  Model routing:
+    - scope, sync, all 5 review agents, synthesize, implement-fixes -> pi/MiniMax-M2.7
+    - adversarial-audit -> pi/MiniMax-M3  (different mind, coverage hunter)
+
+provider: pi
+model: minimax/MiniMax-M2.7
+nodes:
+  - id: scope
+    command: archon-pr-review-scope
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [scope]
+
+  # ── Review agents run SEQUENTIALLY (one-by-one) to avoid timeouts ──
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [sync]
+    provider: pi
+    model: minimax/MiniMax-M2.7
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [code-review]
+    provider: pi
+    model: minimax/MiniMax-M2.7
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [error-handling]
+    provider: pi
+    model: minimax/MiniMax-M2.7
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [test-coverage]
+    provider: pi
+    model: minimax/MiniMax-M2.7
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [comment-quality]
+    provider: pi
+    model: minimax/MiniMax-M2.7
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [docs-impact]
+    provider: pi
+    model: minimax/MiniMax-M2.7
+
+  # ── Adversarial coverage audit: different mind (M3) hunts for MISSED issues ──
+  - id: adversarial-audit
+    command: archon-adversarial-review-audit
+    depends_on: [synthesize]
+    provider: pi
+    model: minimax/MiniMax-M3
+    context: fresh
+
+  - id: implement-fixes
+    command: archon-implement-review-fixes
+    depends_on: [adversarial-audit]
+    provider: pi
+    model: minimax/MiniMax-M2.7

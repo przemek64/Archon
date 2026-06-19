@@ -1,0 +1,231 @@
+name: archon2-pr-review-m27.m3-deep
+description: |
+  Use when: User wants the MOST THOROUGH possible PR review on cheap models, trading time
+  for depth. Built for MiniMax (credits are cheap — make it work hard; runtime irrelevant).
+  Triggers: "deep pr review", "exhaustive review", "review this PR hard", "m27.m3 deep".
+  Does: per-file deep dives (each changed file reviewed on its own), dual-framing cross-checks
+        (attack vs verify), extended aspect coverage (correctness/errors/tests/comments/docs/
+        security/perf/concurrency), then a MULTI-ROUND adversarial audit (M3) that loops
+        find-misses -> fix -> re-audit until nothing net-new or a round cap, then pushes + reports.
+  NOT for: Quick questions about a PR, CI status, "what changed" queries, or when you need speed.
+
+  ARCHON2 DEEP REVIEW VARIANT (naming: see .archon/workflows/NAMING.md; "-deep" qualifier).
+  Premise (see agent memory feedback_minimax_cheap_work_hard): MiniMax under-detects on a
+  single pass, but credits are cheap and time doesn't matter — so compensate with MORE work,
+  not a pricier model. Four force-multipliers over the lean archon2-pr-review-m27.m3:
+    1. Per-file deep dives  — one focused review per changed file (M2.7), not one big-context pass.
+    2. Dual-framing cross-checks — every file reviewed twice: ATTACK ("a bug exists, find it")
+       and VERIFY ("prove each change is correct"); findings are unioned.
+    3. Extended aspects — correctness, error-handling, tests, comments/docs, security,
+       performance, concurrency — every file, every pass.
+    4. Multi-round adversarial audit (M3) — loops audit -> fix -> re-audit until the
+       different-mind auditor finds nothing net-new (or hits maxRounds).
+
+  Model routing:
+    - deep per-file review + synthesize + push/report -> pi/minimax/MiniMax-M2.7 (cheap, worked hard)
+    - multi-round adversarial audit + its in-loop fixer -> pi/minimax/MiniMax-M3 (stronger, different mind)
+    - scope, sync -> pi/MiniMax-M2.7 (default)
+
+provider: pi
+model: minimax/MiniMax-M2.7
+nodes:
+  - id: scope
+    command: archon-pr-review-scope
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [scope]
+
+  # ── Enumerate changed files into a work queue for the per-file loop ──
+  - id: enumerate-files
+    depends_on: [sync]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/review/deep"
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null || gh pr view --json number -q '.number')
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+      BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      git fetch origin "$BASE" --quiet || true
+      # Changed files in the PR, excluding deletions (nothing to review in a removed file).
+      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" > "$ARTIFACTS_DIR/review/files.txt"
+      : > "$ARTIFACTS_DIR/review/reviewed.txt"
+      TOTAL=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0)
+      echo "deep review queue: $TOTAL changed file(s) vs origin/$BASE"
+      cat "$ARTIFACTS_DIR/review/files.txt" | sed 's/^/  /'
+
+  # ── Per-file deep dive: ONE file per iteration, ATTACK + VERIFY framings, all aspects ──
+  - id: deep-review
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [enumerate-files]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Deep Per-File Review — pick the next unreviewed file and go hard
+
+        Credits are cheap and time does not matter: be exhaustive on the ONE file you take
+        this iteration. Do NOT review more than one file per iteration.
+
+        ## Pick your file
+        Compute the next file to review (first line of files.txt not yet in reviewed.txt):
+        ```bash
+        comm -23 <(sort -u "$ARTIFACTS_DIR/review/files.txt") <(sort -u "$ARTIFACTS_DIR/review/reviewed.txt") | head -1
+        ```
+        If that is EMPTY, every file is done — output `<promise>DEEP_DONE</promise>` and stop.
+        Otherwise let FILE be that path.
+
+        ## Read context
+        - `$ARTIFACTS_DIR/review/scope.md` (PR scope)
+        - The change to FILE: `BASE=$(gh pr view $(cat $ARTIFACTS_DIR/.pr-number) --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD" -- "FILE"`
+        - The full current contents of FILE (read it whole — judge the change in context).
+
+        ## Two framings (run BOTH, then union the findings)
+        1. **ATTACK** — assume a bug EXISTS in this change and it is your job to find it. Be
+           hostile. Construct concrete counterexamples; run code/tests if useful.
+        2. **VERIFY** — independently try to PROVE each changed line is correct. Where you
+           cannot prove it, that is a finding.
+
+        ## Aspects to cover for FILE (every one, both framings)
+        correctness/logic · error-handling & failure paths · test coverage (do tests actually
+        exercise the risk? would they pass if the code were wrong?) · comment/docstring accuracy
+        · docs/user-facing impact · security (injection, traversal, unescaped output, secrets)
+        · performance (needless O(n^2), repeated I/O) · concurrency/idempotency/shared-state
+        (e.g. a shared output path written by multiple paths — last-write-wins).
+
+        ## Write findings
+        Append to `$ARTIFACTS_DIR/review/deep/$(echo FILE | tr '/.' '__').md`:
+        ```markdown
+        # Deep review: FILE
+        ## [SEVERITY] Title    (SEVERITY ∈ CRITICAL|HIGH|MEDIUM|LOW)
+        - **Location**: FILE:line
+        - **Framing**: attack|verify
+        - **Aspect**: correctness|error-handling|...
+        - **Evidence**: exact reasoning / command run / output vs expected
+        - **Fix**: concise recommended fix
+        ```
+        If the file is genuinely clean, write a one-line "no findings" note with why.
+
+        ## Mark done (CRITICAL — do this exactly once, last)
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/reviewed.txt"
+        ```
+        Then, if more files remain, do NOT emit any completion signal (the loop continues).
+        If none remain after this, output `<promise>DEEP_DONE</promise>`.
+      until: DEEP_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0)
+        done=$(grep -c . "$ARTIFACTS_DIR/review/reviewed.txt" 2>/dev/null || echo 0)
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Aggregate all per-file findings into the consolidated review + post ──
+  - id: synthesize-deep
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [deep-review]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Aggregate the deep per-file review into one consolidated report.
+
+      Read every `$ARTIFACTS_DIR/review/deep/*.md`. Combine all findings, DEDUPLICATE
+      (same file:line + same claim = one), and order by severity (CRITICAL > HIGH > MEDIUM > LOW).
+
+      Write `$ARTIFACTS_DIR/review/consolidated-review.md` with: an executive summary + overall
+      verdict (APPROVE | REQUEST_CHANGES | NEEDS_DISCUSSION); a severity count table; then a
+      section per severity. For each CRITICAL and HIGH finding use this exact structure so the
+      downstream fixer can parse it:
+      ```
+      ### {Title}
+      **Location**: `{file}:{line}`
+      **Problem**: {what's wrong}
+      **Recommended Fix**: {concise fix}
+      **Why**: {impact}
+      ```
+      List MEDIUM/LOW more briefly in tables.
+
+      Then post a PR comment summarizing it:
+      ```bash
+      PR=$(cat $ARTIFACTS_DIR/.pr-number)
+      gh pr comment "$PR" --body "$(cat $ARTIFACTS_DIR/review/consolidated-review.md)"
+      ```
+      Output a one-line confirmation only.
+
+  # ── Multi-round adversarial audit (M3): audit -> fix -> re-audit until clean / round cap ──
+  - id: init-audit-state
+    depends_on: [synthesize-deep]
+    bash: |
+      mkdir -p "$ARTIFACTS_DIR/review/audit"
+      cat > "$ARTIFACTS_DIR/review/audit-state.json" << 'STATEEOF'
+      { "phase": "auditing", "round": 0, "maxRounds": 4, "status": "running" }
+      STATEEOF
+      echo "audit-state.json seeded (maxRounds=4)"
+    timeout: 30000
+
+  - id: adversarial-audit
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [init-audit-state]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Multi-Round Adversarial Audit — different mind, hunt for what was MISSED
+
+        You are a DIFFERENT, stronger mind than the M2.7 deep review. You play ONE role this
+        iteration, set by `phase` in `$ARTIFACTS_DIR/review/audit-state.json`.
+
+        Read first:
+        - `$ARTIFACTS_DIR/review/audit-state.json` — phase, round, maxRounds, status
+        - `$ARTIFACTS_DIR/review/consolidated-review.md` — current known findings (exclusion list)
+        - The diff: `PR=$(cat $ARTIFACTS_DIR/.pr-number); BASE=$(gh pr view $PR --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD"`
+
+        ## ROLE: AUDITOR (phase = "auditing")
+        Hunt ONLY for issues NOT already in consolidated-review.md (net-new; duplicates = failure).
+        Substantiate each with file:line + concrete evidence (run code/tests if useful). You are
+        READ-ONLY on source here — write only to `$ARTIFACTS_DIR/review/`.
+        - Append a round record to `$ARTIFACTS_DIR/review/audit/round-{round}.json`:
+          `{ "netNew": <count>, "findings": [ {"severity","file","line","claim","fix"} ... ] }`
+        - For every net-new CRITICAL/HIGH, append it (prefixed `[ADVERSARIAL]`) to the matching
+          severity section of consolidated-review.md using the same Title/Location/Problem/
+          Recommended Fix/Why structure, so the fixer will address it.
+        - Update audit-state.json:
+          * net-new CRITICAL/HIGH found AND round < maxRounds -> `"phase":"fixing"`
+          * none found (no net-new CRITICAL/HIGH) -> `"status":"clean"`
+          * round >= maxRounds -> `"status":"exhausted"`
+
+        ## ROLE: FIXER (phase = "fixing")
+        Apply ONLY the `[ADVERSARIAL]` net-new CRITICAL/HIGH findings from the latest audit round.
+        Edit the real source in the worktree. Stage ONLY files you edited (never `git add -A/.`/`-u`;
+        never stage `$ARTIFACTS_DIR`/`.archon/`/`*.scratch.md`), then
+        `git commit -m "fix: address adversarial audit findings (round {round}) (#<pr>)"`.
+        Update audit-state.json: `"phase":"auditing"`, increment `"round"` by 1.
+
+        ## COMPLETION
+        After updating audit-state.json, check `status`:
+        - `"clean"` or `"exhausted"` -> output `<promise>AUDIT_DONE</promise>`
+        - otherwise -> emit no completion signal (loop continues).
+      until: AUDIT_DONE
+      max_iterations: 12
+      fresh_context: true
+      until_bash: |
+        grep -qE '"status"\s*:\s*"(clean|exhausted)"' "$ARTIFACTS_DIR/review/audit-state.json"
+
+  # ── Push any audit fixes and post a final report ──
+  - id: push-and-report
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [adversarial-audit]
+    context: fresh
+    prompt: |
+      Finalize the deep review.
+
+      1. If the adversarial audit committed any fixes, push them to the PR branch:
+         `git push origin HEAD` (if it fails on divergence: `git pull --rebase origin $(git branch --show-current) && git push origin HEAD`).
+         Discard any synced workflow noise first: `git checkout -- .archon/ 2>/dev/null; git clean -fd .archon/ 2>/dev/null`.
+      2. Read `$ARTIFACTS_DIR/review/consolidated-review.md` and every `$ARTIFACTS_DIR/review/audit/round-*.json`.
+      3. Post ONE final PR comment summarizing: total findings by severity (deep pass + audit),
+         how many audit rounds ran and how it terminated (clean vs exhausted), net-new found per
+         round, and what was auto-fixed vs left for manual decision.
+      Output only a brief confirmation.
