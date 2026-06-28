@@ -1,0 +1,171 @@
+name: archonx-pr-merge-gate-p6
+description: |
+  grey-factory stage P6 — the MECHANICAL merge gate. Reads the structured verdict the
+  p5 spec-review posted (`<!-- gf-verdict:p5 … -->`) and makes a DETERMINISTIC merge
+  decision — no new LLM judgment. Mergeable iff the review actually completed AND there
+  are no CRITICAL/HIGH blocking findings. On mergeable: opens ONE deduped follow-up
+  issue for the deferrable minor findings, posts the p6 marker, and (phase 1) recommends
+  a human merge — or (phase 2, ARCHON_P6_AUTOMERGE=1) merges the PR. On HOLD: posts the
+  blocking reasons and FAILS the run (no p6 marker) so the orchestrator parks p6:blocked.
+
+  Design: docs/PLAN_merge-gate-p6.md. Runner: pr-workflow (ARGUMENTS = PR number).
+  Fully mechanical — providers = []. Read-only on source; never edits the diff.
+
+  NOT for: reviewing (that is p5), implementing (p2), planning (p1).
+
+provider: pi
+model: minimax/MiniMax-M2.7   # unused — every node is deterministic bash; no model call
+
+nodes:
+  # ── Resolve PR, base, head, linked issue, owner/repo ──
+  - id: fetch-pr
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR"
+      PR=$(echo "${ARGUMENTS:-}" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
+      [ -n "$PR" ] || PR=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
+      [ -n "$PR" ] || PR=$(gh pr view --json number -q '.number' 2>/dev/null)
+      echo "$PR" | grep -qE '^[0-9]+$' || { echo "FATAL: no PR number in ARGUMENTS=${ARGUMENTS:-}" >&2; exit 1; }
+      echo "$PR" > "$ARTIFACTS_DIR/.pr-number"
+      gh repo view --json nameWithOwner -q '.nameWithOwner' > "$ARTIFACTS_DIR/.repo"
+      gh pr view "$PR" --json baseRefName -q '.baseRefName' > "$ARTIFACTS_DIR/.pr-base"
+      gh pr view "$PR" --json headRefName -q '.headRefName' > "$ARTIFACTS_DIR/.pr-head"
+      BODY=$(gh pr view "$PR" --json body -q '.body')
+      ISSUE=$(echo "$BODY" | grep -oiE '(fix|fixe[sd]|close[sd]?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | head -1)
+      [ -n "$ISSUE" ] || ISSUE=$(echo "$BODY" | grep -oE '#[0-9]+' | grep -oE '[0-9]+' | head -1)
+      echo "${ISSUE:-}" > "$ARTIFACTS_DIR/.issue-number"
+      echo "p6 merge-gate: PR #$PR base=$(cat $ARTIFACTS_DIR/.pr-base) issue=#${ISSUE:-none}"
+
+  # ── Read the LATEST gf-verdict:p5 block (across PR comments AND review bodies). Fail-closed. ──
+  - id: read-verdict
+    depends_on: [fetch-pr]
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number"); REPO=$(cat "$ARTIFACTS_DIR/.repo")
+      # PR issue-comments + review bodies — p5 posts via `gh pr review` (a review body).
+      gh pr view "$PR" --repo "$REPO" --json comments -q '.comments[].body' > "$ARTIFACTS_DIR/.allbodies" 2>/dev/null || true
+      gh api "repos/$REPO/pulls/$PR/reviews" -q '.[].body' >> "$ARTIFACTS_DIR/.allbodies" 2>/dev/null || true
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      "$PY" - << 'PYEOF'
+      import json, os, re, sys
+      A = os.environ["ARTIFACTS_DIR"]
+      text = open(os.path.join(A, ".allbodies"), encoding="utf-8", errors="replace").read()
+      blocks = re.findall(r'<!--\s*gf-verdict:p5\s*(\{.*?\})\s*-->', text, re.S)
+      if not blocks:
+          print("HOLD: no gf-verdict:p5 block found on the PR (p5 not run, or pre-verdict p5).", file=sys.stderr)
+          sys.exit(3)
+      try:
+          v = json.loads(blocks[-1])  # latest wins
+      except Exception as e:
+          print(f"HOLD: gf-verdict:p5 block is not valid JSON: {e}", file=sys.stderr)
+          sys.exit(3)
+      if v.get("schema") != "gf-verdict/1":
+          print(f"HOLD: unexpected verdict schema {v.get('schema')!r}", file=sys.stderr)
+          sys.exit(3)
+      open(os.path.join(A, "p5-verdict.json"), "w", encoding="utf-8").write(json.dumps(v, indent=2))
+      print("verdict read: reviewed_all=%s blocking=%d deferrable=%d"
+            % (v.get("reviewed_all"), len(v.get("blocking", [])), len(v.get("deferrable", []))))
+      PYEOF
+
+  # ── Decide + act. Mergeable => follow-up issue + p6 marker + (phase2) merge. Else HOLD + exit 1. ──
+  - id: decide-and-act
+    depends_on: [read-verdict]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number"); REPO=$(cat "$ARTIFACTS_DIR/.repo")
+      ISSUE=$(cat "$ARTIFACTS_DIR/.issue-number"); BASE=$(cat "$ARTIFACTS_DIR/.pr-base")
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+
+      # MECHANICAL gate: mergeable iff review completed AND no CRITICAL/HIGH blocking.
+      MERGEABLE=$("$PY" - << 'PYEOF'
+      import json, os
+      A = os.environ["ARTIFACTS_DIR"]
+      v = json.load(open(os.path.join(A, "p5-verdict.json"), encoding="utf-8"))
+      print("yes" if (v.get("reviewed_all") and not v.get("blocking")) else "no")
+      PYEOF
+      )
+
+      # Render the human-readable decision body + verdict block (mechanical).
+      "$PY" - "$PR" "$ISSUE" "$MERGEABLE" << 'PYEOF'
+      import json, os, sys
+      A = os.environ["ARTIFACTS_DIR"]
+      pr, issue, mergeable = sys.argv[1], sys.argv[2], sys.argv[3]
+      v = json.load(open(os.path.join(A, "p5-verdict.json"), encoding="utf-8"))
+      def fmt(items):
+          return "\n".join(f"- `{f['req']}` [{f['severity']}/{f['status']}] {f['text']}" for f in items) or "- (none)"
+      decision = "merge" if mergeable == "yes" else "hold"
+      lines = [f"# p6 merge-gate: {'MERGE-RECOMMENDED' if decision=='merge' else 'HOLD'}",
+               "",
+               f"PR #{pr} · issue #{issue} · verdict `{v.get('verdict')}` · reviewed {v['counts']['reviewed']}/{v['counts']['total']}",
+               "",
+               "**Blocking (CRITICAL/HIGH):**", fmt(v.get("blocking", [])),
+               "",
+               "**Deferrable (MEDIUM/LOW):**", fmt(v.get("deferrable", [])),
+               "",
+               "**Stubs (dependency-gated):**", fmt(v.get("stubs", []))]
+      if decision == "hold" and not v.get("reviewed_all"):
+          lines += ["", "_Review did not complete (reviewed_all=false) — not mergeable._"]
+      open(os.path.join(A, "p6-body.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
+      # follow-up issue body (only used on the mergeable path)
+      fu = [f"<!-- gf-followup:issue-{issue} -->",
+            f"Follow-up for residual minor findings from PR #{pr} (issue #{issue}).",
+            "", "**Depends-on:** #" + str(issue),
+            "", "## Deferrable findings", fmt(v.get("deferrable", [])),
+            "", "## Stubs (dependency-gated)", fmt(v.get("stubs", []))]
+      open(os.path.join(A, "p6-followup.md"), "w", encoding="utf-8").write("\n".join(fu) + "\n")
+      print(decision)
+      PYEOF
+
+      if [ "$MERGEABLE" != "yes" ]; then
+        # HOLD: post reasons WITHOUT a gf-stage:p6 marker, then FAIL so the orchestrator
+        # reaps "terminal w/o artifact" -> retry -> park p6:blocked for a human.
+        gh pr comment "$PR" --repo "$REPO" --body-file "$ARTIFACTS_DIR/p6-body.md" || true
+        echo "p6: HOLD — not mergeable (see PR comment). Failing run so orchestrator parks p6:blocked."
+        exit 1
+      fi
+
+      # ── MERGEABLE ──
+      # Follow-up issue for deferrable residuals (deduped by marker), if any exist.
+      NDEF=$("$PY" -c 'import json,os;v=json.load(open(os.path.join(os.environ["ARTIFACTS_DIR"],"p5-verdict.json")));print(len(v.get("deferrable",[]))+len(v.get("stubs",[])))')
+      FOLLOWUP=""
+      if [ "$NDEF" -gt 0 ] && [ -n "$ISSUE" ]; then
+        EXIST=$(gh issue list --repo "$REPO" --state open -S "gf-followup:issue-$ISSUE in:body" --json number -q '.[0].number' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then
+          gh issue comment "$EXIST" --repo "$REPO" --body "Re-checked at p6 for PR #$PR; residuals still open (see latest p5 verdict)." || true
+          FOLLOWUP="#$EXIST"
+        else
+          # carry the same target: label as the parent so it merges to the right branch when worked.
+          TGT=$(gh issue view "$ISSUE" --repo "$REPO" --json labels -q '.labels[].name' 2>/dev/null | grep -E '^target:' | head -1 || true)
+          LBL=""; [ -n "$TGT" ] && LBL="--label \"$TGT\""
+          TITLE="Follow-up: residual findings from #$ISSUE (PR #$PR)"
+          NEW=$(eval gh issue create --repo "\"$REPO\"" --title "\"$TITLE\"" --body-file "\"$ARTIFACTS_DIR/p6-followup.md\"" $LBL --json url -q '.url' 2>/dev/null || \
+                eval gh issue create --repo "\"$REPO\"" --title "\"$TITLE\"" --body-file "\"$ARTIFACTS_DIR/p6-followup.md\"" $LBL 2>/dev/null)
+          FOLLOWUP="$NEW"
+        fi
+      fi
+
+      # Post the p6 decision comment WITH the gf-stage marker + gf-verdict:p6 block.
+      {
+        cat "$ARTIFACTS_DIR/p6-body.md"
+        [ -n "$FOLLOWUP" ] && printf '\nFollow-up issue: %s\n' "$FOLLOWUP"
+        printf '\n<!-- gf-stage:p6 -->\n'
+        printf '<!-- gf-verdict:p6\n'
+        "$PY" -c "import json,os;v=json.load(open(os.path.join(os.environ['ARTIFACTS_DIR'],'p5-verdict.json')));print(json.dumps({'schema':'gf-verdict/1','stage':'p6','pr':int('$PR'),'decision':'merge','followup':'$FOLLOWUP','p5_verdict':v.get('verdict')},indent=2))"
+        printf '\n-->\n'
+      } > "$ARTIFACTS_DIR/p6-comment.md"
+      gh pr comment "$PR" --repo "$REPO" --body-file "$ARTIFACTS_DIR/p6-comment.md"
+
+      # Phase 1 = recommend only (human merges via pr-validated). Phase 2 = auto-merge.
+      if [ "${ARCHON_P6_AUTOMERGE:-0}" = "1" ]; then
+        gh pr ready "$PR" --repo "$REPO" 2>/dev/null || true
+        gh pr merge "$PR" --repo "$REPO" --squash --delete-branch=false \
+          && echo "p6: AUTO-MERGED PR #$PR into $BASE" \
+          || echo "p6: WARN auto-merge failed; left for human (marker posted, pr-validated will follow)"
+      else
+        echo "p6: MERGE-RECOMMENDED for PR #$PR (phase 1 — human merges). Follow-up: ${FOLLOWUP:-none}"
+      fi
