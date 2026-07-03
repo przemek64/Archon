@@ -1,0 +1,197 @@
+name: archonx-fix-github-issue-r1g
+description: |
+  Use when: a CANDIDATE contract has been staged by p1a and you want the r-family
+  freeze: run the GROUND-CONTRACT gate (anti-FABRICATION) and FREEZE — no coverage gate.
+  This is PART 1g (the gate+freeze stage). It bootstraps from
+  refs/archon-run/issue-<N>-candidate[-<suffix>], repoints the worktree to the candidate's
+  base, EXECUTES every `ground` anchor against the real artifact, and on success promotes
+  the contract to refs/archon-run/issue-<N>-kimi[-<suffix>] + work branch
+  archon/fix-issue-<N>-kimi[-<suffix>] for p2-3kc.
+  Triggers: "fix issue r1g #123", "ground+freeze candidate #123".
+  NOT for: planning/negotiate (run p1a first), coverage (use s1g), implement (p2), review (p3).
+
+  Pipeline: p1a -> r1g -> p2-3kc -> p3-4m3m3k. Pass the SAME suffix to p1a and r1g.
+  from:<ref> (escape hatch) overrides the work-branch start point at freeze.
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If the message is ambiguous, use `gh issue list` to search for matching issues and pick the best match.
+      - IGNORE any trailing variant tokens like `v2`, `sfx:foo`, or `from:<ref>` — they are NOT the issue number.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+
+  # ════════════════════════════════════════════════════════════════
+  # BOOTSTRAP: restore the p1a candidate, repoint worktree to its base
+  #   Reads refs/archon-run/issue-<N>-candidate[-<suffix>] into $ARTIFACTS_DIR and
+  #   hard-resets the worktree to origin/<base> so the gates run against the REAL
+  #   base tree (ground anchors read fixtures; coverage greps the source).
+  # ════════════════════════════════════════════════════════════════
+
+  - id: restore-candidate
+    depends_on: [extract-issue-number]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "restore-candidate: could not resolve issue number" >&2; exit 1; }
+      SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'sfx:[A-Za-z0-9._-]+' | head -1 | sed 's/^sfx://')
+      [ -n "$SFX" ] || SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -owE 'v[0-9]+' | head -1)
+      REF="refs/archon-run/issue-$N-candidate${SFX:+-$SFX}"
+      git rev-parse --verify "$REF" >/dev/null 2>&1 || { echo "restore-candidate: $REF not found — run p1a first with the SAME suffix" >&2; exit 1; }
+      mkdir -p "$ARTIFACTS_DIR/contracts"
+      git cat-file -p "$REF:candidate/plan.md"                  > "$ARTIFACTS_DIR/investigation.md"
+      git cat-file -p "$REF:candidate/contracts/impl.json"      > "$ARTIFACTS_DIR/contracts/impl.json"
+      git cat-file -p "$REF:candidate/contracts/audit-notes.md" > "$ARTIFACTS_DIR/contracts/audit-notes.md" 2>/dev/null || true
+      BASE=$(git cat-file -p "$REF:candidate/base-branch" | tr -d " '\"\r\n"); [ -n "$BASE" ] || BASE=main
+      python -c "import json,sys; json.load(open(sys.argv[1]))" "$ARTIFACTS_DIR/contracts/impl.json" || { echo "restore-candidate: candidate impl.json is invalid JSON" >&2; exit 1; }
+      # This node runs inside a DISPOSABLE Archon task worktree; everything it needs is
+      # already in $ARTIFACTS_DIR (written above) + the candidate ref. A REUSED worktree
+      # carries stale dirt — notably Archon's own tracked .archon/gates.json — which must
+      # NOT block the freeze. So we clean the worktree instead of refusing. The refusal is
+      # kept ONLY as a real safety net for a non-task worktree (a real repo checkout).
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      case "$WT" in
+        *"/worktrees/"*|*task-archon-*|*task-fix-issue-*|*task-review-*) : ;;
+        *) if ! git diff --quiet || ! git diff --cached --quiet; then
+             echo "restore-candidate: uncommitted changes in non-task worktree ($WT); refusing destructive repoint" >&2; exit 1
+           fi ;;
+      esac
+      git fetch origin "$BASE" --quiet || { echo "restore-candidate: fetch origin/$BASE failed" >&2; exit 1; }
+      git reset --hard "origin/$BASE" >/dev/null 2>&1 || { echo "restore-candidate: reset to origin/$BASE failed" >&2; exit 1; }
+      git clean -fdq >/dev/null 2>&1 || true  # drop untracked stragglers so coverage greps see only the base tree
+      printf '%s' "$BASE" > "$ARTIFACTS_DIR/base-branch"
+      echo "restore-candidate: #$N restored from $REF; worktree repointed to origin/$BASE"
+      printf '%s' "$BASE"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4b: GROUND-CONTRACT GATE (design B — anti-fabrication)
+  #   Execute every criterion's `ground` anchor against the REAL artifact in the base
+  #   worktree. If any asserted value contradicts reality, BLOCK the freeze (exit 1) so a
+  #   fabricated offset/byte/count contract never freezes. Criteria without a `ground`
+  #   anchor are skipped. r-family has no coverage gate, so this runs straight after the bootstrap.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: ground-contract
+    depends_on: [restore-candidate]
+    timeout: 120000
+    bash: |
+      set -uo pipefail
+      C="$ARTIFACTS_DIR/contracts/impl.json"
+      [ -f "$C" ] || { echo "ground-contract: $C missing" >&2; exit 1; }
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      ART="$ARTIFACTS_DIR" GATE_BASH="$(command -v bash)" "$PY" - "$C" << 'PYEOF'
+      import json, subprocess, sys, os
+      d = json.load(open(sys.argv[1], encoding="utf-8"))
+      crit = d.get("criteria", [])
+      anchored = [c for c in crit if isinstance(c.get("ground"), dict)
+                  and c["ground"].get("locator") and "expected" in c["ground"]]
+      print(f"ground-contract: {len(crit)} criteria, {len(anchored)} anchored")
+      fails = []
+      deferred = []
+      for c in anchored:
+          loc = c["ground"]["locator"]; exp = str(c["ground"]["expected"]).strip()
+          # DEFER: branch-identity locators are only true on the work branch during p2,
+          # not in this freeze worktree (a task branch). Enforced post-impl by verify.
+          if ("rev-parse --abbrev-ref" in loc) or ("symbolic-ref" in loc):
+              deferred.append((c["name"], "branch-identity locator (enforced on the work branch during p2 verify)"))
+              print(f"  [DEFER] {c['name']}: branch-identity locator")
+              continue
+          r = subprocess.run([os.environ.get("GATE_BASH") or "bash", "-c", loc], capture_output=True, text=True)
+          act = (r.stdout or "").strip()
+          # DEFER: not groundable at freeze (errors or empty) -> references an artifact the
+          # implementation will create; each criterion verify enforces it in p2/p3.
+          if r.returncode != 0 or act == "":
+              deferred.append((c["name"], f"not groundable at freeze (rc={r.returncode}, empty_output={act==''}); references a not-yet-created artifact"))
+              print(f"  [DEFER] {c['name']}: not groundable yet (rc={r.returncode}, actual {act!r})")
+              continue
+          # Artifact exists now: a non-empty value contradicting expected is a real fabrication.
+          ok = (act == exp)
+          print(f"  [{'PASS' if ok else 'FAIL'}] {c['name']}: expected {exp!r} actual {act!r}")
+          if not ok:
+              fails.append((c["name"], exp, act))
+      if deferred:
+          nfile = os.path.join(os.environ["ART"], "contracts", "deferred.md")
+          with open(nfile, "w", encoding="utf-8") as f:
+              f.write("# GROUND-CONTRACT - DEFERRED criteria (not groundable at freeze)" + chr(10)*2)
+              f.write("These reference the work branch or artifacts the implementation will create, so they cannot be ground-checked at freeze. They are NOT fabrications; each criterion verify enforces them in p2/p3 after implementation." + chr(10)*2)
+              for n, why in deferred:
+                  f.write(f"- **{n}**: {why}" + chr(10))
+          print(f"ground-contract: {len(deferred)} criterion(s) DEFERRED (not groundable at freeze) -> {nfile}")
+      if fails:
+          dfile = os.path.join(os.environ["ART"], "contracts", "defects.md")
+          with open(dfile, "w", encoding="utf-8") as f:
+              f.write("# CONTRACT DEFECTS - ground-contract gate (design B)" + chr(10)*2)
+              f.write("These criteria assert values the REAL artifact (present at freeze) contradicts. The contract was NOT frozen. Fix the expected values (read the artifact) and re-run." + chr(10)*2)
+              for n, e, a in fails:
+                  f.write(f"- **{n}**: contract says `{e}`, real artifact yields `{a}`" + chr(10))
+          print(f"GROUND-CONTRACT FAILED: {len(fails)} fabricated value(s) -- see {dfile}", file=sys.stderr)
+          sys.exit(1)
+      checked = len(anchored) - len(deferred)
+      print(f"GROUND-CONTRACT PASSED: {checked} anchored value(s) match reality, {len(deferred)} deferred to p2/p3.")
+      PYEOF
+
+  # ════════════════════════════════════════════════════════════════
+  # FREEZE — promote the gated contract to the canonical side ref + work branch.
+  #   Orphan commit under refs/archon-run/issue-<N>-kimi[-<suffix>] (not on any branch,
+  #   so .archon-run/ cannot leak into the PR). Work branch archon/fix-issue-<N>-kimi
+  #   is set to the base tip (or a from:<ref> override) and NOT checked out, so p2-3kc
+  #   claims it. Local-only: nothing pushed. Gated behind the freeze-gate(s) above.
+  # ════════════════════════════════════════════════════════════════
+
+  - id: freeze
+    depends_on: [restore-candidate, ground-contract]
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "freeze: could not resolve issue number" >&2; exit 1; }
+      SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'sfx:[A-Za-z0-9._-]+' | head -1 | sed 's/^sfx://')
+      [ -n "$SFX" ] || SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -owE 'v[0-9]+' | head -1)
+      FROM=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'from:[^[:space:]]+' | head -1 | sed 's/^from://')
+      BASE=$(cat "$ARTIFACTS_DIR/base-branch" 2>/dev/null | tr -d " '\"\r\n"); [ -n "$BASE" ] || BASE=main
+      BR="archon/fix-issue-$N-kimi${SFX:+-$SFX}"
+      REF="refs/archon-run/issue-$N-kimi${SFX:+-$SFX}"
+
+      [ -f "$ARTIFACTS_DIR/contracts/impl.json" ] || { echo "freeze: contracts/impl.json missing" >&2; exit 1; }
+      [ -f "$ARTIFACTS_DIR/investigation.md" ]     || { echo "freeze: investigation.md missing" >&2; exit 1; }
+
+      git config user.email  >/dev/null 2>&1 || git config user.email "archon@local"
+      git config user.name   >/dev/null 2>&1 || git config user.name  "Archon"
+
+      STAGE=$(mktemp -d)
+      printf '%s' "$BASE" > "$STAGE/base-branch"
+      add_blob() { [ -f "$1" ] || return 0; local blob; blob=$(git hash-object -w "$1"); git update-index --add --cacheinfo "100644,$blob,$2"; }
+      export GIT_INDEX_FILE="$STAGE/index"
+      git read-tree --empty
+      add_blob "$ARTIFACTS_DIR/investigation.md"          ".archon-run/issue-$N/plan.md"
+      add_blob "$ARTIFACTS_DIR/contracts/impl.json"       ".archon-run/issue-$N/contracts/impl.json"
+      add_blob "$ARTIFACTS_DIR/contracts/audit-notes.md"  ".archon-run/issue-$N/contracts/audit-notes.md"
+      add_blob "$STAGE/base-branch"                       ".archon-run/issue-$N/base-branch"
+      TREE=$(git write-tree)
+      HANDOFF=$(git commit-tree "$TREE" -m "archon handoff for #$N [r1g]")
+      unset GIT_INDEX_FILE
+      git update-ref "$REF" "$HANDOFF"
+
+      START=HEAD
+      if [ -n "$FROM" ]; then
+        git fetch origin "$FROM" --quiet 2>/dev/null || true
+        START=$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git rev-parse --verify "origin/$FROM^{commit}" 2>/dev/null \
+             || MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git rev-parse --verify "$FROM^{commit}" 2>/dev/null) \
+             || { echo "freeze: from:$FROM not resolvable" >&2; exit 1; }
+        echo "freeze: work branch starting from override ref $FROM ($START)" >&2
+      fi
+      git branch -f "$BR" "$START"
+      echo "p1g froze handoff for #$N -> $REF @ $(git rev-parse --short "$HANDOFF"); work branch $BR @ $(git rev-parse --short "$BR") (base=$BASE${FROM:+, from=$FROM})"
+      echo "Next: archon workflow run archonx-fix-github-issue-p2-3kc $N${SFX:+ $SFX}"

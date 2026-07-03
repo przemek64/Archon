@@ -1,60 +1,116 @@
-name: archon2-pr-review-m3.m3
+name: archonx-fix-github-issue-part3-4m3m3o
 description: |
-  Use when: You want a same-model ADVERSARIAL PR review where M3 reviews and a second
-  M3 "mind" audits the first M3's work — a dialectic, not a cross-model check. Built to
-  probe whether M3-vs-M3 (different framing/seed, not a different model) raises detection
-  over a single M3 pass.
-  Triggers: "m3 vs m3 review", "m3.m3 review", "adversarial m3 review", "self-adversarial review".
-  NOT for: Quick questions, CI status, "what changed". Use a cheap single-pass review for those.
+  PART 3 of 3 of the split fix-issue chain (see part1 for the full design). This part
+  BOOTSTRAPS from the PR part2 opened on the shared branch archon/fix-issue-<N>-opus, runs
+  the M3.M3 adversarial review (M3 per-file ATTACK+VERIFY pass + a SECOND M3 mind
+  auditing for MISSES/FALSE-POSITIVES), aggressively self-fixes findings (opus),
+  simplifies changed code (opus), and reports back to the issue.
+  Triggers: "fix issue part3 #123", "review+selffix #123", "m3m3 review the PR for #123".
+  NOT for: planning (part1), implementing (part2), one-shot fixes (the monolith).
 
-  ARCHON2 REVIEW VARIANT (naming: see .archon/workflows/NAMING.md). review=m3, adversary=m3.
+  ── HANDOFF ───────────────────────────────────────────────────────────────────
+  The `bootstrap` node resolves the PR via `gh pr list --head archon/fix-issue-<N>-opus`
+  and lands the worktree ON the PR head (prefers origin/<branch>, which part2 pushed).
+  Because HEAD == PR head, the embedded review's enumerate-files (`origin/$BASE...HEAD`)
+  correctly scopes to the PR's own changes — no PR-head bug here (unlike the standalone
+  review workflows, whose worktree is a fresh branch off base).
 
-  WHY M3↔M3: M2.7 under-detects (proved: it APPROVED a planted CONTROL_FIELD_COUNT bug);
-  M3 caught it. This variant puts M3 on BOTH seats so the adversary is as strong as the
-  reviewer, and frames the audit as challenging the FIRST M3's findings — hunting both its
-  MISSES and its FALSE POSITIVES.
-
-  TIMEOUT HANDLING (learned 2026-06-19, the m27.m3-deep run died here):
-    The failure was the pi->MiniMax request timing out (~500s), NOT Archon's idle_timeout,
-    and loop-iteration errors are NOT retried (dag-executor returns failed immediately).
-    Three mitigations, all in this file:
-      1. BOUND every M3 call to ONE changed file per iteration (deep review AND audit run
-         off a per-file queue) so no single request carries the whole diff -> each finishes
-         well under the request window.
-      2. CONCISE outputs — prompts cap reasoning/verbosity so M3 streams a result fast.
-      3. trigger_rule: all_done on the final report node -> even if an M3 iteration times
-         out and fails its node, the report still PUBLISHES whatever was already written to
-         consolidated-review.md (the prior run found the bug but never posted it).
+  Model routing:
+    - m3-review / m3-audit / m3-audit-resume -> pi/minimax/MiniMax-M3 (both review seats)
+    - self-fix / simplify                    -> claude/opus
+    - everything else trivial                -> pi/MiniMax-M2.7
 
 provider: pi
-model: minimax/MiniMax-M2.7   # trivial/aggregation nodes default cheap; M3 seats overridden below
+model: minimax/MiniMax-M2.7
+
 nodes:
-  - id: scope
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: RESOLVE ISSUE + BOOTSTRAP FROM THE PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If ambiguous, use `gh issue list` to search for matching issues and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example: 709
+
+  # Land the worktree on the PR head and resolve the PR number.
+  - id: bootstrap
+    depends_on: [extract-issue-number]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "bootstrap: could not resolve issue number" >&2; exit 1; }
+      BR="archon/fix-issue-$N-opus"
+      git worktree prune 2>/dev/null || true
+      git fetch origin --quiet 2>/dev/null || true
+      # part2 pushed the PR head to origin/$BR — prefer it (resolves any local
+      # branch-checked-out-in-another-worktree contention). Fall back to the local ref.
+      if git rev-parse --verify "origin/$BR" >/dev/null 2>&1; then
+        if ! git checkout -B "$BR" "origin/$BR" 2>/dev/null; then
+          git checkout "$BR" 2>/dev/null && git reset --hard "origin/$BR" >/dev/null 2>&1
+        fi
+      else
+        git checkout -B "$BR" "$BR" 2>/dev/null || git checkout "$BR" 2>/dev/null || {
+          echo "bootstrap: cannot check out $BR (neither origin nor local). Run part2 first" >&2; exit 1; }
+      fi
+      PR=$(gh pr list --head "$BR" --json number -q '.[0].number' 2>/dev/null)
+      [ -n "$PR" ] || { echo "bootstrap: no open PR with head $BR — run part2 first" >&2; exit 1; }
+      echo "$PR" > "$ARTIFACTS_DIR/.pr-number"
+      echo "$N"  > "$ARTIFACTS_DIR/.issue-number"
+      mkdir -p "$ARTIFACTS_DIR/review"
+      echo "part3 bootstrap: on $BR @ $(git rev-parse --short HEAD), PR #$PR"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: REVIEW — M3.M3 (transplanted from archonx-pr-review-m3-m3, embedded form)
+  #   HEAD == PR head (bootstrap), so origin/$BASE...HEAD is the PR's own diff.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-scope
     command: archon-pr-review-scope
+    depends_on: [bootstrap]
+    context: fresh
 
-  - id: sync
+  - id: review-sync
     command: archon-sync-pr-with-main
-    depends_on: [scope]
+    depends_on: [review-scope]
 
-  # ── Enumerate changed files into a work queue shared by both M3 passes ──
   - id: enumerate-files
-    depends_on: [sync]
+    depends_on: [review-sync]
     bash: |
       export PATH="$PATH:/home/user/.local/bin"
       set -uo pipefail
       mkdir -p "$ARTIFACTS_DIR/review/deep" "$ARTIFACTS_DIR/review/audit"
-      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null || gh pr view --json number -q '.number')
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
+      fi
+      if [ -z "$PR_NUMBER" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+      fi
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        echo "FATAL: could not resolve PR number (.pr-number=empty, ARGUMENTS=${ARGUMENTS:-}, branch has no PR)" >&2
+        exit 1
+      fi
       echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+      echo "enumerate-files: resolved PR #$PR_NUMBER"
       BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
       git fetch origin "$BASE" --quiet || true
-      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" > "$ARTIFACTS_DIR/review/files.txt"
+      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" | { grep -vE '^[.]archive/' || true; } > "$ARTIFACTS_DIR/review/files.txt"
       : > "$ARTIFACTS_DIR/review/reviewed.txt"
       : > "$ARTIFACTS_DIR/review/audited.txt"
-      TOTAL=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0)
+      TOTAL=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0; } | tail -1 )
       echo "M3.M3 queue: $TOTAL changed file(s) vs origin/$BASE"
       cat "$ARTIFACTS_DIR/review/files.txt" | sed 's/^/  /'
 
-  # ── PASS 1 — M3 reviewer: one file per iteration, ATTACK + VERIFY, all aspects ──
   - id: m3-review
     provider: pi
     model: minimax/MiniMax-M3
@@ -108,12 +164,11 @@ nodes:
       max_iterations: 200
       fresh_context: true
       until_bash: |
-        total=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0)
-        done=$(grep -c . "$ARTIFACTS_DIR/review/reviewed.txt" 2>/dev/null || echo 0)
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed.txt" 2>/dev/null || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
-  # ── Aggregate pass-1 findings + post a first comment (cheap model; mechanical) ──
-  - id: synthesize
+  - id: review-synthesize
     provider: pi
     model: minimax/MiniMax-M2.7
     depends_on: [m3-review]
@@ -140,11 +195,10 @@ nodes:
       ```
       Output a one-line confirmation only.
 
-  # ── PASS 2 — M3 adversary: a SECOND M3 mind audits pass-1, one file per iteration ──
   - id: m3-audit
     provider: pi
     model: minimax/MiniMax-M3
-    depends_on: [synthesize]
+    depends_on: [review-synthesize]
     idle_timeout: 600000
     loop:
       prompt: |
@@ -192,25 +246,20 @@ nodes:
       max_iterations: 200
       fresh_context: true
       until_bash: |
-        total=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0)
-        done=$(grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0)
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
-  # ── Resilience: if m3-audit timed out mid-queue (e.g. 3/8 done), resume the rest ──
-  # Runs even when m3-audit FAILED (all_done). Emits exactly MORE or DONE (nothing else),
-  # so the resume loop's `when:` can gate cleanly. trailing newline is trimmed by Archon.
   - id: audit-status
     depends_on: [m3-audit]
     trigger_rule: all_done
     timeout: 30000
     bash: |
       set -uo pipefail
-      total=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0)
-      done=$(grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0)
+      total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+      done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
       if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
 
-  # Only runs when files remain unaudited (when == MORE). If audit finished 8/8 -> SKIPPED
-  # (no M3 call). Identical per-file audit; resumes from audited.txt where the timeout left off.
   - id: m3-audit-resume
     provider: pi
     model: minimax/MiniMax-M3
@@ -251,12 +300,11 @@ nodes:
       max_iterations: 200
       fresh_context: true
       until_bash: |
-        total=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0)
-        done=$(grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0)
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
-  # ── Final report — all_done so it publishes whether the audit/resume completed, skipped, or failed ──
-  - id: report
+  - id: review-report
     provider: pi
     model: minimax/MiniMax-M2.7
     depends_on: [m3-audit-resume]
@@ -279,3 +327,35 @@ nodes:
       gh pr comment "$PR" --body "$(cat $ARTIFACTS_DIR/review/final-summary.md)"
       ```
       Write that summary to `$ARTIFACTS_DIR/review/final-summary.md` first. Output a brief confirmation.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: SELF-FIX  (opus) — consumes consolidated-review.md
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: self-fix
+    provider: claude
+    model: opus
+    command: archon-self-fix-all
+    depends_on: [review-report]
+    trigger_rule: all_done
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: SIMPLIFY (opus)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    provider: claude
+    model: opus
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [simplify]
+    context: fresh

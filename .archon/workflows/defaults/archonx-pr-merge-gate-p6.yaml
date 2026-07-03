@@ -70,6 +70,25 @@ nodes:
       if v.get("schema") != "gf-verdict/1":
           print(f"HOLD: unexpected verdict schema {v.get('schema')!r}", file=sys.stderr)
           sys.exit(3)
+      # ── Narrow, deterministic loosening (NOT a general re-bucket) ──
+      # The VERSION-bump / `.archive`-copy convention is LOW and NEVER a merge blocker
+      # (labeltool CLAUDE.md Learned Rules §1). Reviewers keep mis-flagging it HIGH/MEDIUM
+      # and dumping it into blocking[]. Demote ONLY that convention out of blocking into
+      # deferrable; every other finding (incl. unrelated MEDIUMs) is left exactly as-is.
+      _CONV_RE = re.compile(r'(?:VERSION.{0,60}(?:increment|patch|bump))|(?:\.archive\b)', re.I | re.S)
+      _kept, _moved = [], []
+      for _it in v.get("blocking", []):
+          if _CONV_RE.search(_it.get("text", "")):
+              _it["severity"] = "LOW"
+              _it["demoted"] = "version/.archive convention (CLAUDE.md Learned Rules §1): LOW, never blocking"
+              _moved.append(_it)
+          else:
+              _kept.append(_it)
+      if _moved:
+          v["blocking"] = _kept
+          v.setdefault("deferrable", []).extend(_moved)
+          print("demoted %d version/.archive convention finding(s) blocking->deferrable"
+                % len(_moved), file=sys.stderr)
       open(os.path.join(A, "p5-verdict.json"), "w", encoding="utf-8").write(json.dumps(v, indent=2))
       print("verdict read: reviewed_all=%s blocking=%d deferrable=%d"
             % (v.get("reviewed_all"), len(v.get("blocking", [])), len(v.get("deferrable", []))))

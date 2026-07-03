@@ -12,7 +12,8 @@ description: |
 
   Accepts: An idea description, a path to an existing prd.md, or a directory with prd.md + prd.json
 
-provider: claude
+provider: pi
+model: minimax/MiniMax-M2.7
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -21,7 +22,6 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: detect-input
-    model: small
     prompt: |
       # Detect Ralph Input
 
@@ -187,9 +187,10 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: implement
+    provider: codex
+    model: gpt-5.5
     depends_on: [validate-prd]
     idle_timeout: 600000
-    model: large
     loop:
       prompt: |
         # Ralph Agent — Autonomous Story Implementation

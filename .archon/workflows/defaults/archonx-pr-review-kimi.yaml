@@ -1,4 +1,4 @@
-name: archon2-pr-review-kimi
+name: archonx-pr-review-kimi
 description: |
   Use when: User wants a comprehensive code review of a pull request with automatic fixes,
   running the review agents on Kimi instead of codex/gpt-5.4 (A/B reviewer test variant).

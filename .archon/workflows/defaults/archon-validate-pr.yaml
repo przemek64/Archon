@@ -10,8 +10,8 @@ description: |
   This workflow is designed for running in parallel — each instance finds its own free ports
   to avoid conflicts. Produces artifacts in $ARTIFACTS_DIR/ and posts a validation report.
 
-provider: claude
-model: large
+provider: pi
+model: minimax/MiniMax-M2.7
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -86,11 +86,15 @@ nodes:
     command: archon-validate-pr-code-review-main
     depends_on: [fetch-pr, resolve-paths]
     context: fresh
+    provider: codex
+    model: gpt-5.5
 
   - id: code-review-feature
     command: archon-validate-pr-code-review-feature
     depends_on: [fetch-pr, resolve-paths, code-review-main]
     context: fresh
+    provider: codex
+    model: gpt-5.5
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 3: E2E TESTING — Sequential (after code reviews finish)
@@ -117,7 +121,6 @@ nodes:
       Consider: even if a change is backend, if it affects what the frontend displays
       (e.g., API response format changes, SSE event changes), it IS e2e_testable.
     depends_on: [fetch-pr]
-    model: small
     allowed_tools: []
     output_format:
       type: object
@@ -209,3 +212,5 @@ nodes:
     depends_on: [code-review-main, code-review-feature, e2e-test-main, e2e-test-feature, classify-testability, cleanup-processes]
     trigger_rule: all_done
     context: fresh
+    provider: codex
+    model: gpt-5.5

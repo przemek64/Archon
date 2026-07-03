@@ -1,4 +1,4 @@
-name: archon2-pr-review-m27.m3
+name: archonx-pr-review-m27-m3
 description: |
   Use when: User wants a comprehensive code review of a pull request with automatic fixes,
   run cheaply on MiniMax with an adversarial coverage audit by a stronger different mind.

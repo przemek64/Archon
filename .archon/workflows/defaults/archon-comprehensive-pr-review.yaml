@@ -10,6 +10,8 @@ description: |
   This workflow produces artifacts in $ARTIFACTS_DIR/../reviews/pr-{number}/ and posts
   a comprehensive review comment to the GitHub PR.
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   - id: scope
     command: archon-pr-review-scope
@@ -21,27 +23,39 @@ nodes:
   - id: code-review
     command: archon-code-review-agent
     depends_on: [sync]
+    provider: codex
+    model: gpt-5.4
 
   - id: error-handling
     command: archon-error-handling-agent
     depends_on: [sync]
+    provider: codex
+    model: gpt-5.4
 
   - id: test-coverage
     command: archon-test-coverage-agent
     depends_on: [sync]
+    provider: codex
+    model: gpt-5.4
 
   - id: comment-quality
     command: archon-comment-quality-agent
     depends_on: [sync]
+    provider: codex
+    model: gpt-5.4
 
   - id: docs-impact
     command: archon-docs-impact-agent
     depends_on: [sync]
+    provider: codex
+    model: gpt-5.4
 
   - id: synthesize
     command: archon-synthesize-review
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
+    provider: codex
+    model: gpt-5.4
 
   - id: implement-fixes
     command: archon-implement-review-fixes

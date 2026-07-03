@@ -1,0 +1,361 @@
+name: archonx-fix-github-issue-part3-4m3m3g
+description: |
+  PART 3 of 3 of the split fix-issue chain (see part1 for the full design). This part
+  BOOTSTRAPS from the PR part2 opened on the shared branch archon/fix-issue-<N>-glm, runs
+  the M3.M3 adversarial review (M3 per-file ATTACK+VERIFY pass + a SECOND M3 mind
+  auditing for MISSES/FALSE-POSITIVES), aggressively self-fixes findings (glm),
+  simplifies changed code (glm), and reports back to the issue.
+  Triggers: "fix issue part3 #123", "review+selffix #123", "m3m3 review the PR for #123".
+  NOT for: planning (part1), implementing (part2), one-shot fixes (the monolith).
+
+  ── HANDOFF ───────────────────────────────────────────────────────────────────
+  The `bootstrap` node resolves the PR via `gh pr list --head archon/fix-issue-<N>-glm`
+  and lands the worktree ON the PR head (prefers origin/<branch>, which part2 pushed).
+  Because HEAD == PR head, the embedded review's enumerate-files (`origin/$BASE...HEAD`)
+  correctly scopes to the PR's own changes — no PR-head bug here (unlike the standalone
+  review workflows, whose worktree is a fresh branch off base).
+
+  Model routing:
+    - m3-review / m3-audit / m3-audit-resume -> pi/minimax/MiniMax-M3 (both review seats)
+    - self-fix / simplify                    -> pi/zai/glm-5.2
+    - everything else trivial                -> pi/MiniMax-M2.7
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: RESOLVE ISSUE + BOOTSTRAP FROM THE PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If ambiguous, use `gh issue list` to search for matching issues and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example: 709
+
+  # Land the worktree on the PR head and resolve the PR number.
+  - id: bootstrap
+    depends_on: [extract-issue-number]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "bootstrap: could not resolve issue number" >&2; exit 1; }
+      BR="archon/fix-issue-$N-glm"
+      git worktree prune 2>/dev/null || true
+      git fetch origin --quiet 2>/dev/null || true
+      # part2 pushed the PR head to origin/$BR — prefer it (resolves any local
+      # branch-checked-out-in-another-worktree contention). Fall back to the local ref.
+      if git rev-parse --verify "origin/$BR" >/dev/null 2>&1; then
+        if ! git checkout -B "$BR" "origin/$BR" 2>/dev/null; then
+          git checkout "$BR" 2>/dev/null && git reset --hard "origin/$BR" >/dev/null 2>&1
+        fi
+      else
+        git checkout -B "$BR" "$BR" 2>/dev/null || git checkout "$BR" 2>/dev/null || {
+          echo "bootstrap: cannot check out $BR (neither origin nor local). Run part2 first" >&2; exit 1; }
+      fi
+      PR=$(gh pr list --head "$BR" --json number -q '.[0].number' 2>/dev/null)
+      [ -n "$PR" ] || { echo "bootstrap: no open PR with head $BR — run part2 first" >&2; exit 1; }
+      echo "$PR" > "$ARTIFACTS_DIR/.pr-number"
+      echo "$N"  > "$ARTIFACTS_DIR/.issue-number"
+      mkdir -p "$ARTIFACTS_DIR/review"
+      echo "part3 bootstrap: on $BR @ $(git rev-parse --short HEAD), PR #$PR"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: REVIEW — M3.M3 (transplanted from archonx-pr-review-m3-m3, embedded form)
+  #   HEAD == PR head (bootstrap), so origin/$BASE...HEAD is the PR's own diff.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [bootstrap]
+    context: fresh
+
+  - id: review-sync
+    command: archon-sync-pr-with-main
+    depends_on: [review-scope]
+
+  - id: enumerate-files
+    depends_on: [review-sync]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/review/deep" "$ARTIFACTS_DIR/review/audit"
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
+      fi
+      if [ -z "$PR_NUMBER" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+      fi
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        echo "FATAL: could not resolve PR number (.pr-number=empty, ARGUMENTS=${ARGUMENTS:-}, branch has no PR)" >&2
+        exit 1
+      fi
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+      echo "enumerate-files: resolved PR #$PR_NUMBER"
+      BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      git fetch origin "$BASE" --quiet || true
+      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" | { grep -vE '^[.]archive/' || true; } > "$ARTIFACTS_DIR/review/files.txt"
+      : > "$ARTIFACTS_DIR/review/reviewed.txt"
+      : > "$ARTIFACTS_DIR/review/audited.txt"
+      TOTAL=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0; } | tail -1 )
+      echo "M3.M3 queue: $TOTAL changed file(s) vs origin/$BASE"
+      cat "$ARTIFACTS_DIR/review/files.txt" | sed 's/^/  /'
+
+  - id: m3-review
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [enumerate-files]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # M3 Review (pass 1) — pick the next unreviewed file and review ONLY that file
+
+        TIMEOUT DISCIPLINE: review exactly ONE file this iteration. Be thorough but CONCISE —
+        no preamble, no restating the diff; go straight to findings. This keeps the request short.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>REVIEW_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Context (read only what you need for FILE)
+        - `$ARTIFACTS_DIR/review/scope.md`
+        - The change: `BASE=$(gh pr view $(cat $ARTIFACTS_DIR/.pr-number) --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD" -- "FILE"`
+        - The current full contents of FILE.
+
+        ## Two framings (run BOTH, union findings)
+        1. ATTACK — assume a bug EXISTS; construct a concrete counterexample (run code/tests if cheap).
+        2. VERIFY — try to PROVE each changed line correct; where you can't, that's a finding.
+
+        ## Aspects (every one): correctness/logic · error-handling · test coverage (would the
+        tests fail if the code were wrong?) · comment/docstring accuracy · docs impact ·
+        security · performance · concurrency/shared-state.
+
+        ## Write findings to `$ARTIFACTS_DIR/review/deep/$(echo FILE | tr '/.' '__').md`:
+        ```markdown
+        # M3 review: FILE
+        ## [SEVERITY] Title   (CRITICAL|HIGH|MEDIUM|LOW)
+        - **Location**: FILE:line
+        - **Framing**: attack|verify
+        - **Aspect**: ...
+        - **Evidence**: exact reasoning / command / output vs expected
+        - **Fix**: concise fix
+        ```
+        If clean, write a one-line "no findings" note with why.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/reviewed.txt"
+        ```
+        Then if files remain, emit NOTHING (loop continues); if none remain, output `<promise>REVIEW_DONE</promise>`.
+      until: REVIEW_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  - id: review-synthesize
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [m3-review]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Aggregate the M3 pass-1 per-file findings into one report.
+
+      Read every `$ARTIFACTS_DIR/review/deep/*.md`. Combine, DEDUPLICATE (same file:line + claim
+      = one), order by severity. Write `$ARTIFACTS_DIR/review/consolidated-review.md` with an
+      executive summary, a verdict (APPROVE | REQUEST_CHANGES | NEEDS_DISCUSSION), a severity
+      count table, then a section per severity. For each CRITICAL/HIGH use exactly:
+      ```
+      ### {Title}
+      **Location**: `{file}:{line}`
+      **Problem**: {what's wrong}
+      **Recommended Fix**: {fix}
+      **Why**: {impact}
+      ```
+      MEDIUM/LOW in brief tables. Then post it:
+      ```bash
+      PR=$(cat $ARTIFACTS_DIR/.pr-number)
+      gh pr comment "$PR" --body "$(cat $ARTIFACTS_DIR/review/consolidated-review.md)"
+      ```
+      Output a one-line confirmation only.
+
+  - id: m3-audit
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [review-synthesize]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # M3 Adversarial Audit (pass 2) — you are a DIFFERENT M3 mind auditing the first M3
+
+        TIMEOUT DISCIPLINE: audit exactly ONE file this iteration; be terse; no preamble.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/audited.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>AUDIT_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Read
+        - The pass-1 findings for FILE in `$ARTIFACTS_DIR/review/consolidated-review.md`
+          (these are the FIRST M3's claims — your exclusion list AND your target).
+        - The change: `BASE=$(gh pr view $(cat $ARTIFACTS_DIR/.pr-number) --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD" -- "FILE"` and FILE's full contents.
+
+        ## Your job — dialectic against the first M3 (do BOTH):
+        1. MISSES — find NET-NEW issues the first M3 did not report for FILE. Substantiate with
+           file:line + concrete evidence (run code/tests if cheap). Duplicates of pass-1 = failure.
+        2. FALSE POSITIVES / OVERREACH — for each pass-1 finding on FILE, judge whether it actually
+           holds. If a pass-1 CRITICAL/HIGH is wrong or overstated, say so with evidence.
+
+        ## Write to `$ARTIFACTS_DIR/review/audit/$(echo FILE | tr '/.' '__').md`:
+        ```markdown
+        # M3 audit: FILE
+        ## NET-NEW
+        ## [SEVERITY] Title  — Location FILE:line — Evidence — Fix
+        ## REBUTTALS
+        - {pass-1 finding} -> UPHELD | REFUTED ({evidence})
+        ```
+        For every NET-NEW CRITICAL/HIGH, ALSO append it (prefixed `[ADVERSARIAL]`) to the matching
+        severity section of `$ARTIFACTS_DIR/review/consolidated-review.md`, same
+        Title/Location/Problem/Recommended Fix/Why structure, so it survives even if a later
+        iteration times out.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/audited.txt"
+        ```
+        Then if files remain, emit NOTHING; if none remain, output `<promise>AUDIT_DONE</promise>`.
+      until: AUDIT_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  - id: audit-status
+    depends_on: [m3-audit]
+    trigger_rule: all_done
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+      done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
+      if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
+
+  - id: m3-audit-resume
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [audit-status]
+    when: "$audit-status.output == 'MORE'"
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # M3 Adversarial Audit (RESUME) — finish the files the timed-out audit didn't reach
+
+        TIMEOUT DISCIPLINE: audit exactly ONE file this iteration; be terse; no preamble.
+
+        ## Pick your file (next file in files.txt not yet in audited.txt)
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/audited.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>AUDIT_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Read
+        - The pass-1 findings for FILE in `$ARTIFACTS_DIR/review/consolidated-review.md`.
+        - The change: `BASE=$(gh pr view $(cat $ARTIFACTS_DIR/.pr-number) --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD" -- "FILE"` and FILE's full contents.
+
+        ## Your job (do BOTH):
+        1. MISSES — net-new issues the first M3 did not report for FILE (file:line + evidence).
+        2. FALSE POSITIVES — judge each pass-1 finding on FILE: UPHELD or REFUTED, with evidence.
+
+        ## Write to `$ARTIFACTS_DIR/review/audit/$(echo FILE | tr '/.' '__').md` (NET-NEW + REBUTTALS,
+        same format as the main audit). For every NET-NEW CRITICAL/HIGH, append it prefixed
+        `[ADVERSARIAL]` to the matching severity section of consolidated-review.md.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/audited.txt"
+        ```
+        Then if files remain, emit NOTHING; if none remain, output `<promise>AUDIT_DONE</promise>`.
+      until: AUDIT_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  - id: review-report
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [m3-audit-resume]
+    trigger_rule: all_done
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Finalize the M3.M3 review. The audit pass MAY have ended early (timeout) — work with
+      whatever exists; do not assume it completed.
+
+      1. Read `$ARTIFACTS_DIR/review/consolidated-review.md` (now includes any `[ADVERSARIAL]`
+         net-new findings appended by the audit) and every `$ARTIFACTS_DIR/review/audit/*.md`.
+      2. Count files audited vs total:
+         `t=$(grep -c . $ARTIFACTS_DIR/review/files.txt); a=$(grep -c . $ARTIFACTS_DIR/review/audited.txt 2>/dev/null||echo 0); echo "$a/$t audited"`.
+      3. Post ONE final PR comment summarizing: total findings by severity (pass 1 + audit
+         net-new), how many files the audit covered (flag if incomplete due to timeout), and a
+         short list of pass-1 findings the adversary REFUTED. Then the final verdict.
+      ```bash
+      PR=$(cat $ARTIFACTS_DIR/.pr-number)
+      gh pr comment "$PR" --body "$(cat $ARTIFACTS_DIR/review/final-summary.md)"
+      ```
+      Write that summary to `$ARTIFACTS_DIR/review/final-summary.md` first. Output a brief confirmation.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: SELF-FIX  (glm) — consumes consolidated-review.md
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: self-fix
+    provider: pi
+    model: zai/glm-5.2
+    command: archon-self-fix-all
+    depends_on: [review-report]
+    trigger_rule: all_done
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: SIMPLIFY (glm)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    provider: pi
+    model: zai/glm-5.2
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [simplify]
+    context: fresh

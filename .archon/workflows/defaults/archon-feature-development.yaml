@@ -5,11 +5,13 @@ description: |
   Does: Implements the plan with validation loops -> creates pull request.
   NOT for: Creating plans (plans should be created separately), bug fixes, code reviews.
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   - id: implement
+    provider: codex
+    model: gpt-5.5
     command: archon-implement
-    provider: claude
-    model: large
 
   - id: create-pr
     command: archon-create-pr

@@ -84,6 +84,38 @@ nodes:
       gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
     depends_on: [extract-issue-number]
 
+  # Derive the PR base branch from the issue's `target:` label.
+  #   no label / "target: main" -> main ;  "target: <x>" -> feat/<x>
+  - id: resolve-base-branch
+    depends_on: [extract-issue-number, fetch-issue]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      ISSUE_NUM=$(echo $extract-issue-number.output | grep -oE '[0-9]+' | head -1)
+      TARGET=$(gh issue view "$ISSUE_NUM" --json labels -q '[.labels[].name | select(startswith("target: "))][0] // ""' | sed 's/^target: //')
+      if [ -z "$TARGET" ] || [ "$TARGET" = "main" ]; then BR="main"; else BR="feat/$TARGET"; fi
+      if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: base '$BR' (target='${TARGET:-none}') not on origin" >&2; exit 1
+      fi
+      # Repoint the worktree onto the resolved base BEFORE any node reads or writes
+      # code, so investigation/implementation see the correct tree and the final PR
+      # diff is scoped to this fix only. The GUI cuts the worktree from
+      # worktree.baseBranch (.archon/config.yaml), which may not match this issue's
+      # target: label — that mismatch is what produced the giant phantom-deletion
+      # diffs. Safe here: this node runs early (investigate/plan/implement all
+      # depend on it), so no implementation commits exist yet. Guard refuses to
+      # repoint if uncommitted changes are present, in case the DAG is ever reordered.
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "resolve-base-branch: uncommitted changes present; refusing destructive repoint" >&2; exit 1
+      fi
+      if ! git fetch origin "$BR" --quiet; then
+        echo "resolve-base-branch: fetch origin/$BR failed" >&2; exit 1
+      fi
+      if ! git reset --hard "origin/$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: reset to origin/$BR failed" >&2; exit 1
+      fi
+      echo "resolve-base-branch -> $BR (worktree repointed)" >&2
+      printf '%s' "$BR"
+
   - id: classify
     prompt: |
       You are an issue classifier. Analyze the GitHub issue below and determine its type.
@@ -136,7 +168,7 @@ nodes:
     provider: codex
     model: gpt-5.5
     command: archon-investigate-issue
-    depends_on: [classify, web-research]
+    depends_on: [classify, web-research, resolve-base-branch]
     when: "$classify.output.issue_type == 'bug'"
     context: fresh
 
@@ -144,7 +176,7 @@ nodes:
     provider: codex
     model: gpt-5.5
     command: archon-create-plan
-    depends_on: [classify, web-research]
+    depends_on: [classify, web-research, resolve-base-branch]
     when: "$classify.output.issue_type != 'bug'"
     context: fresh
 
@@ -420,11 +452,13 @@ nodes:
   #   node, blocking create-pr and downstream. stdlib json + git only.
   # ═══════════════════════════════════════════════════════════════
   - id: project-gate
-    depends_on: [validate]
+    depends_on: [validate, resolve-base-branch]
     bash: |
       set -uo pipefail
       [ -f .archon/gates.json ] || { echo "No .archon/gates.json — skipping project gate."; exit 0; }
-      CHANGED=$(git diff --name-only "${BASE_BRANCH:-main}...HEAD")
+      BASE=$resolve-base-branch.output
+      echo "Project gate base: $BASE"
+      CHANGED=$(git diff --name-only "$BASE...HEAD")
       echo "Changed files:"; echo "$CHANGED" | sed 's/^/  /'
       PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
       "$PY" - "$CHANGED" << 'PYEOF'
@@ -465,7 +499,13 @@ nodes:
 
       ## Instructions
 
-      1. Check git status — ensure all changes are committed. If uncommitted changes exist, stage and commit them.
+      1. Clean up runtime-generated files, then commit ONLY the implementation's own changes:
+         - Archon may sync its bundled default workflows into this worktree. Discard them so they never reach the PR:
+           `git checkout -- .archon/ 2>/dev/null; git clean -fd .archon/ 2>/dev/null`
+         - Run `git status`. The adversarial loop already committed the fix. If — and only if — source files the
+           implementation actually edited remain uncommitted, stage those specific files BY PATH and commit them.
+           NEVER use `git add -A` / `git add .` / `git add -u`, and never stage anything under `.archon/`,
+           `$ARTIFACTS_DIR`, `*.scratch.md`, or `*-report.md`.
       2. Push the branch: `git push -u origin HEAD`
       3. Read implementation artifacts from `$ARTIFACTS_DIR/` for context:
          - `$ARTIFACTS_DIR/investigation.md` or `$ARTIFACTS_DIR/plan.md`
@@ -475,7 +515,7 @@ nodes:
       4. Check if a PR already exists for this branch: `gh pr list --head $(git branch --show-current)`
          - If PR exists, skip creation and capture its number
       5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
-      6. Create a DRAFT PR: `gh pr create --draft --base $BASE_BRANCH`
+      6. Create a DRAFT PR: `gh pr create --draft --base $resolve-base-branch.output`
          - Title: concise, imperative mood, under 70 chars
          - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, validation evidence, the adversarial acceptance verdict (which criteria passed and final scores), and `Fixes #...`.
          - Link to issue: include `Fixes #...` or `Closes #...`
@@ -486,7 +526,7 @@ nodes:
          PR_URL=$(gh pr view --json url -q '.url')
          echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
          ```
-    depends_on: [project-gate]
+    depends_on: [project-gate, resolve-base-branch]
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════

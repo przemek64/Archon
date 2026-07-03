@@ -17,12 +17,16 @@ description: |
 
   NOT for: Executing existing plans (use archon-plan-to-pr), quick fixes, standalone reviews.
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   # ═══════════════════════════════════════════════════════════════════
   # PHASE 0: CREATE PLAN
   # ═══════════════════════════════════════════════════════════════════
 
   - id: create-plan
+    provider: claude
+    model: opus
     command: archon-create-plan
     context: fresh
 
@@ -31,6 +35,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════════
 
   - id: plan-setup
+    provider: claude
+    model: opus
     command: archon-plan-setup
     depends_on: [create-plan]
     context: fresh
@@ -40,6 +46,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════════
 
   - id: confirm-plan
+    provider: claude
+    model: opus
     command: archon-confirm-plan
     depends_on: [plan-setup]
     context: fresh
@@ -49,11 +57,11 @@ nodes:
   # ═══════════════════════════════════════════════════════════════════
 
   - id: implement-tasks
+    provider: codex
+    model: gpt-5.5
     command: archon-implement-tasks
     depends_on: [confirm-plan]
     context: fresh
-    provider: claude
-    model: large
 
   # ═══════════════════════════════════════════════════════════════════
   # PHASE 4: VALIDATE

@@ -1,4 +1,4 @@
-name: archon2-fix-github-issue-codex-kimi.codex-kimi
+name: archonx-fix-github-issue-1c-2gm3-3gc-4g
 description: |
   Use when: User wants to FIX/RESOLVE/IMPLEMENT a GitHub issue AND wants the
   implementation hardened by an adversarial self-verification loop where the
@@ -13,30 +13,38 @@ description: |
   LABELTOOL ADV2 MIXED VARIANT. Like archon-fix-github-issue-adversarial-mixed, but
   the adversarial loop runs the GENERATOR and EVALUATOR on DIFFERENT providers via
   loop.roleModels ("fresh context AND different mind"):
-    - GENERATOR  (phase = "building")   → pi/kimi-coding/kimi-for-coding
+    - GENERATOR  (phase = "building")   → pi/zai/glm-5.2
     - EVALUATOR  (phase = "evaluating") → codex/gpt-5.4
   Same blind spot can no longer pass its own work: the evaluator is a different
   model than the builder. Combined with fresh_context, each role gets a fresh
   session on a different mind.
 
-  KIMI-REVIEW VARIANT. Cost experiment: forked from the codex-review variant, but
-  the 6 review nodes + synthesize move from codex/gpt-5.4 to pi/kimi-coding/kimi-for-coding
-  (cheaper). Tests whether kimi reviews well enough to replace expensive codex on the
-  review surface. Investigate/plan and the adversarial EVALUATOR stay on codex/gpt-5.4.
+  GLM VARIANT. Forked from the codex-kimi variant: every role that was on
+  pi/kimi-coding/kimi-for-coding now runs on pi/zai/glm-5.2 (GLM 5.2) — the
+  GENERATOR, negotiate PROPOSER, self-fix, simplify, and the 6 review nodes +
+  synthesize. Tests GLM 5.2 as the builder/reviewer. Investigate/plan and the
+  adversarial EVALUATOR stay on codex/gpt-5.4 (the different mind).
+
+  ADVNEG VARIANT (2gm3): the single-pass negotiate-criteria node is replaced by a
+  TWO-SEAT cross-model negotiate — glm PROPOSER drafts the contract, then a
+  MiniMax-M3 ADVERSARY (different model, fresh context) audits + emits the final
+  contract. Based on the #70 experiment where glm->m3 added 7 grounded criteria
+  that single-pass glm/glm missed.
 
   Model routing:
     - investigate / plan run on codex/gpt-5.4
-    - negotiate-criteria, self-fix, simplify run on pi/kimi-coding/kimi-for-coding
+    - negotiate PROPOSER, self-fix, simplify run on pi/zai/glm-5.2
+    - negotiate ADVERSARY runs on pi/minimax/MiniMax-M3
     - code-review, error-handling, test-coverage, comment-quality, docs-impact,
-      synthesize run on pi/kimi-coding/kimi-for-coding  (CHANGED from codex/gpt-5.4)
+      synthesize run on pi/zai/glm-5.2  (CHANGED from codex/gpt-5.4)
     - everything else trivial (classify, web-research, create-pr, review-scope,
       review-classify, validate, report) stays on pi/MiniMax-M2.7
 
   Identical to labeltool's archon-fix-github-issue, EXCEPT Phase 4 (IMPLEMENT) is
   replaced by a GAN-style adversarial implementation loop (inspired by
   archon-adversarial-dev):
-    a. negotiate-criteria — derives a concrete, testable acceptance CONTRACT from
-       the GitHub issue body + investigation.md / plan.md.
+    a. negotiate (two-seat) — glm proposer drafts, M3 adversary audits + emits a
+       concrete, testable acceptance CONTRACT from the issue + investigation.md.
     b. adversarial-implement — a fresh-context state machine that alternates
        GENERATOR (pi/kimi: builds the fix in the worktree, commits, writes
        implementation.md) and EVALUATOR (codex/gpt-5.4: read-only on source; runs
@@ -206,25 +214,27 @@ nodes:
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 4: ADVERSARIAL IMPLEMENT (cross-model "different mind")
-  #   4a. negotiate-criteria  → derive acceptance contract    (mixed: kimi)
+  #   4a. negotiate (TWO-SEAT adversarial, cross-model):
+  #         negotiate-propose        → glm drafts the contract
+  #         negotiate-adversary-merge → m3 audits + emits final contract
   #   4b. init-impl-state     → state machine seed           (bash)
   #   4c. adversarial-implement → generator ↔ evaluator loop
-  #         GENERATOR  (building)   → pi/kimi-coding/kimi-for-coding
+  #         GENERATOR  (building)   → pi/zai/glm-5.2
   #         EVALUATOR  (evaluating) → codex/gpt-5.4   (different mind)
   # ═══════════════════════════════════════════════════════════════
 
-  # 4a. Derive a concrete, testable acceptance contract from the issue + plan.
-  #     This is the "oracle" the evaluator scores against — the handoff root-cause
-  #     for Archon drift was that no executable acceptance criteria existed, so a
-  #     wrong implementation could not fail. The contract fixes that.
-  - id: negotiate-criteria
+  # 4a-i. PROPOSER (glm): draft the acceptance contract from the issue + plan.
+  #       The contract is the "oracle" the evaluator scores against; the handoff
+  #       root-cause for Archon drift was that no executable acceptance criteria
+  #       existed, so a wrong implementation could not fail.
+  - id: negotiate-propose
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     prompt: |
-      You define the acceptance CONTRACT for fixing this GitHub issue. The contract
-      is what an adversarial evaluator will later score the implementation against,
-      so it must be concrete, testable, and faithful to the issue — NOT to whatever
-      the implementer happens to build.
+      You are the PROPOSER. Draft the acceptance CONTRACT for fixing this GitHub
+      issue. The contract is what an adversarial evaluator will later score the
+      implementation against, so it must be concrete, testable, and faithful to the
+      issue — NOT to whatever the implementer happens to build.
 
       ## GitHub Issue
 
@@ -240,25 +250,69 @@ nodes:
       investigation or the bridged feature plan). Treat the issue body as the
       AUTHORITATIVE spec; the investigation is the proposed approach.
 
-      ## Your Task — play BOTH sides, sequentially
+      ## Your task
+      Extract EVERY requirement the issue states: positive requirements (what must
+      happen), constraints (what must NOT happen / must stay unchanged), and edge
+      cases — each as its own first-class criterion. Propose 5-15. Each must be
+      concrete and verifiable (a command to run / output to inspect / file to read),
+      never "works correctly". You MAY read repo files to ground your `verify` steps.
 
-      **Step 1 — Proposer:** Extract every requirement the issue states. Capture
-      positive requirements (what must happen), constraints (what must NOT happen or
-      must stay unchanged), and edge cases — each as a first-class criterion. Propose
-      5-15 criteria.
+      Write `$ARTIFACTS_DIR/contracts/proposed.json` with the Write tool:
+      ```json
+      { "issue": "<number>",
+        "criteria": [ { "name": "kebab", "description": "...", "verify": "...", "threshold": 7 } ] }
+      ```
+      Return the same JSON as structured output.
+    depends_on: [bridge-artifacts]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
 
-      **Step 2 — Adversary:** Re-read each criterion and ask: is it specific enough
-      to verify programmatically? Could a sloppy happy-path implementation pass it?
-      Tighten vague criteria, add the missing edge cases, raise the bar. If the issue
-      contains a literal expected-output / golden block, turn it into an exact-match
-      criterion.
+  # 4a-ii. ADVERSARY (m3, a DIFFERENT MODEL, fresh context): audit + emit final.
+  #        This is the seat that produces the contract the rest of the pipeline uses.
+  - id: negotiate-adversary-merge
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [negotiate-propose]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      You are the CRITERIA ADVERSARY — a DIFFERENT mind than the proposer. Find what
+      the proposed contract MISSES, then emit the FINAL merged contract. A shallow,
+      incomplete contract is how a PR silently drops part of the spec — close every hole.
 
-      Each criterion MUST be concrete and verifiable. Examples:
-      - GOOD: "GET /api/items returns 200 with a JSON array; each item has id and name"
-      - GOOD: "Submitting the form with an empty title shows a validation error and does not save"
-      - BAD: "The feature works correctly"
+      Read:
+      - `$ARTIFACTS_DIR/issue.md` if present, otherwise treat the issue below as the
+        AUTHORITATIVE spec:
 
-      Write the final contract to `$ARTIFACTS_DIR/contracts/impl.json` using the Write tool:
+        $fetch-issue.output
+
+      - `$ARTIFACTS_DIR/investigation.md` — the proposed approach (NOT authoritative).
+      - `$ARTIFACTS_DIR/contracts/proposed.json` — the proposer's draft (your target).
+      You MAY read repo files to ground checks.
+
+      ## Audit the draft against the issue (do ALL):
+      1. MISSING DELIVERABLES — every deliverable / constraint / "How to test" bullet
+         in the issue with NO matching criterion. Add one for each. Do not collapse
+         several into one.
+      2. WHOLE-SCOPE COVERAGE — for anything that must hold across MULTIPLE files (a
+         renamed/removed constant, a hardcoded value, a port), the `verify` must check
+         the ENTIRE affected directory, not just the headline file: require the new
+         token present AND the old/forbidden token absent
+         (e.g. `! git grep -n 'ttymxc4' -- bridge/ && git grep -q 'ttymxc0' -- bridge/`).
+      3. ANTI-THEATER — a criterion is satisfied only by CODE or observable behavior,
+         NEVER by a comment/docstring/PR text claiming it. Where a behavior is required,
+         `verify` must locate the actual call in source
+         (e.g. `git grep -n 'chmod' -- bridge/tty_bridge.py`), not a sentence.
+      4. HAPPY-PATH HOLES — reject any criterion a shallow one-file edit could pass
+         while leaving the rest of the scope stale; tighten it.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Add ONLY criteria grounded in the issue text. Do not invent requirements the
+      issue never states — that causes false rejections downstream.
+
+      ## Output
+      Write the FINAL merged contract to `$ARTIFACTS_DIR/contracts/impl.json` (union of
+      upheld proposed criteria + your additions, deduplicated, tightened):
       ```json
       {
         "issue": "<number>",
@@ -270,11 +324,9 @@ nodes:
         ]
       }
       ```
-
-      Then return the same JSON as your structured output.
-    depends_on: [bridge-artifacts]
-    context: fresh
-    allowed_tools: [Read, Write, Glob, Grep, Bash]
+      Also write `$ARTIFACTS_DIR/contracts/audit-notes.md` (what you UPHELD/TIGHTENED/
+      DROPPED and every criterion you ADDED, with why). Return the final contract JSON
+      as structured output.
     output_format:
       type: object
       properties:
@@ -294,7 +346,7 @@ nodes:
 
   # 4b. Seed the implementation state machine.
   - id: init-impl-state
-    depends_on: [negotiate-criteria]
+    depends_on: [negotiate-adversary-merge]
     bash: |
       mkdir -p "$ARTIFACTS_DIR/feedback"
       cat > "$ARTIFACTS_DIR/impl-state.json" << 'STATEEOF'
@@ -318,7 +370,7 @@ nodes:
   #     fallback used if the state file/field is missing.
   - id: adversarial-implement
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     depends_on: [init-impl-state]
     idle_timeout: 600000
     loop:
@@ -330,9 +382,9 @@ nodes:
         stateFile: $ARTIFACTS_DIR/impl-state.json
         field: phase
         map:
-          building:   { provider: pi,    model: kimi-coding/kimi-for-coding }
+          building:   { provider: pi,    model: zai/glm-5.2 }
           evaluating: { provider: codex, model: gpt-5.4 }
-        default:      { provider: pi,    model: kimi-coding/kimi-for-coding }
+        default:      { provider: pi,    model: zai/glm-5.2 }
       prompt: |
         # Adversarial Implementation — Generator ↔ Evaluator (cross-model)
 
@@ -602,14 +654,14 @@ nodes:
   - id: code-review
     command: archon-code-review-agent
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     depends_on: [review-classify]
     context: fresh
 
   - id: error-handling
     command: archon-error-handling-agent
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     depends_on: [review-classify]
     when: "$review-classify.output.run_error_handling == 'true'"
     context: fresh
@@ -617,7 +669,7 @@ nodes:
   - id: test-coverage
     command: archon-test-coverage-agent
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     depends_on: [review-classify]
     when: "$review-classify.output.run_test_coverage == 'true'"
     context: fresh
@@ -625,7 +677,7 @@ nodes:
   - id: comment-quality
     command: archon-comment-quality-agent
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     depends_on: [review-classify]
     when: "$review-classify.output.run_comment_quality == 'true'"
     context: fresh
@@ -633,39 +685,39 @@ nodes:
   - id: docs-impact
     command: archon-docs-impact-agent
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     depends_on: [review-classify]
     when: "$review-classify.output.run_docs_impact == 'true'"
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 8: SYNTHESIZE + SELF-FIX
-  #   mixed: self-fix on pi/kimi-coding/kimi-for-coding
+  #   mixed: self-fix on pi/zai/glm-5.2
   # ═══════════════════════════════════════════════════════════════
 
   - id: synthesize
     command: archon-synthesize-review
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
 
   - id: self-fix
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     command: archon-self-fix-all
     depends_on: [synthesize]
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 9: SIMPLIFY
-  #   mixed: simplify on pi/kimi-coding/kimi-for-coding
+  #   mixed: simplify on pi/zai/glm-5.2
   # ═══════════════════════════════════════════════════════════════
 
   - id: simplify
     provider: pi
-    model: kimi-coding/kimi-for-coding
+    model: zai/glm-5.2
     command: archon-simplify-changes
     depends_on: [self-fix]
     context: fresh

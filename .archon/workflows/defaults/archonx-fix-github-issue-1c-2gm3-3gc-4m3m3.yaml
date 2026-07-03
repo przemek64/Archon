@@ -1,0 +1,896 @@
+name: archonx-fix-github-issue-1c-2gm3-3gc-4m3m3
+description: |
+  Use when: User wants to FIX/RESOLVE/IMPLEMENT a GitHub issue AND wants the
+  implementation hardened by an adversarial self-verification loop where the
+  evaluator is a GENUINELY DIFFERENT MIND than the generator before it proceeds
+  to validation and PR creation.
+  Triggers: "fix issue adversarially v2", "adv2 fix #123", "different-mind adversarial fix",
+            "fix it with a codex evaluator", "cross-model adversarial fix".
+  NOT for: Comprehensive multi-agent reviews (use archon-issue-review-full),
+           questions about issues, CI failures, PR reviews, general exploration.
+           Plain single-shot fixes (use archon-fix-github-issue).
+
+  LABELTOOL ADV2 MIXED VARIANT. Like archon-fix-github-issue-adversarial-mixed, but
+  the adversarial loop runs the GENERATOR and EVALUATOR on DIFFERENT providers via
+  loop.roleModels ("fresh context AND different mind"):
+    - GENERATOR  (phase = "building")   → pi/zai/glm-5.2
+    - EVALUATOR  (phase = "evaluating") → codex/gpt-5.4
+  Same blind spot can no longer pass its own work: the evaluator is a different
+  model than the builder. Combined with fresh_context, each role gets a fresh
+  session on a different mind.
+
+  M3.M3-REVIEW VARIANT. Forked from the codex-kimi variant, but the entire REVIEW
+  surface is replaced by the archonx-pr-review-m3.m3 chain: instead of the kimi
+  multi-agent fan-out (code-review + error-handling + test-coverage + comment-quality
+  + docs-impact + synthesize), an M3 reviewer does a per-file ATTACK+VERIFY pass and a
+  SECOND M3 mind adversarially audits it for MISSES and FALSE POSITIVES. M3 sits on
+  BOTH review seats because M2.7 under-detects (it APPROVED a planted CONTROL_FIELD_COUNT
+  bug; M3 caught it). Investigate/plan and the adversarial EVALUATOR stay on codex/gpt-5.4;
+  the kimi adversarial-implement loop is unchanged. self-fix/simplify consume the M3.M3
+  consolidated-review.md.
+
+  Model routing:
+    - investigate / plan run on codex/gpt-5.4
+    - negotiate PROPOSER, self-fix, simplify run on pi/zai/glm-5.2
+    - negotiate ADVERSARY runs on pi/minimax/MiniMax-M3 (two-seat cross-model negotiate)
+    - m3-review, m3-audit, m3-audit-resume run on pi/minimax/MiniMax-M3 (the review surface)
+    - everything else trivial (classify, web-research, create-pr, review-scope,
+      review-sync, enumerate-files, review-synthesize, audit-status, review-report,
+      validate, report) stays on pi/MiniMax-M2.7
+
+  Identical to labeltool's archon-fix-github-issue, EXCEPT Phase 4 (IMPLEMENT) is
+  replaced by a GAN-style adversarial implementation loop (inspired by
+  archon-adversarial-dev):
+    a. negotiate (two-seat) — glm proposer drafts, M3 adversary audits + emits a
+       concrete, testable acceptance CONTRACT from the issue + investigation.md.
+    b. adversarial-implement — a fresh-context state machine that alternates
+       GENERATOR (pi/glm: builds the fix in the worktree, commits, writes
+       implementation.md) and EVALUATOR (codex/gpt-5.4: read-only on source; runs
+       tests; actively tries to BREAK the fix; scores every criterion 1-10). Any
+       criterion below threshold loops back to the generator WITH the adversarial
+       feedback, up to maxRetries.
+  Downstream invariants preserved: the fix is committed to the worktree branch and
+  $ARTIFACTS_DIR/implementation.md exists, so validate / project-gate / create-pr
+  work unchanged.
+
+  DAG workflow that:
+  1. Classifies the issue (bug/feature/enhancement/etc)
+  2. Researches context (web research + codebase exploration via investigate/plan)
+  3. Routes to investigate (bugs) or plan (features) based on classification
+  4. Negotiates an acceptance contract, then implements via the cross-model adversarial loop
+  5. Runs the repo's project gate (.archon/gates.json) before PR creation
+  6. Creates a draft PR using the repo's PR template
+  7. Runs the M3.M3 adversarial review (M3 per-file review + second-M3 audit)
+  8. Aggressively self-fixes all findings (tests, docs, error handling)
+  9. Simplifies changed code (implements fixes directly, not just reports)
+  10. Reports results back to the GitHub issue with follow-up suggestions
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If the message is ambiguous (e.g., "fix the SQLite timestamp bug"), use `gh issue list` to search for matching issues and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+
+  - id: fetch-issue
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      # Strip quotes, whitespace, markdown backticks from AI output
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number from: $extract-issue-number.output" >&2
+        exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+
+  # Derive the PR base branch from the issue's `target:` label.
+  #   no label / "target: main" -> main ;  "target: <x>" -> feat/<x>
+  - id: resolve-base-branch
+    depends_on: [extract-issue-number, fetch-issue]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      ISSUE_NUM=$(echo $extract-issue-number.output | grep -oE '[0-9]+' | head -1)
+      TARGET=$(gh issue view "$ISSUE_NUM" --json labels -q '[.labels[].name | select(startswith("target: "))][0] // ""' | sed 's/^target: //')
+      if [ -z "$TARGET" ] || [ "$TARGET" = "main" ]; then BR="main"; else BR="feat/$TARGET"; fi
+      if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: base '$BR' (target='${TARGET:-none}') not on origin" >&2; exit 1
+      fi
+      # Repoint the worktree onto the resolved base BEFORE any node reads or writes
+      # code, so investigation/implementation see the correct tree and the final PR
+      # diff is scoped to this fix only. The GUI cuts the worktree from
+      # worktree.baseBranch (.archon/config.yaml), which may not match this issue's
+      # target: label — that mismatch is what produced the giant phantom-deletion
+      # diffs. Safe here: this node runs early (investigate/plan/implement all
+      # depend on it), so no implementation commits exist yet. Guard refuses to
+      # repoint if uncommitted changes are present, in case the DAG is ever reordered.
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "resolve-base-branch: uncommitted changes present; refusing destructive repoint" >&2; exit 1
+      fi
+      if ! git fetch origin "$BR" --quiet; then
+        echo "resolve-base-branch: fetch origin/$BR failed" >&2; exit 1
+      fi
+      if ! git reset --hard "origin/$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: reset to origin/$BR failed" >&2; exit 1
+      fi
+      echo "resolve-base-branch -> $BR (worktree repointed)" >&2
+      printf '%s' "$BR"
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below and determine its type.
+
+      ## Issue Content
+
+      $fetch-issue.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | "add", "new", "support", "would be nice", net-new capability |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-issue]
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH (parallel with PR template fetch)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
+  #   mixed: codex/gpt-5.4
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    provider: codex
+    model: gpt-5.4
+    command: archon-investigate-issue
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: plan
+    provider: codex
+    model: gpt-5.4
+    command: archon-create-plan
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  # Bridge: ensure investigation.md exists for the implement step
+  # archon-fix-issue reads from $ARTIFACTS_DIR/investigation.md
+  # archon-create-plan writes to $ARTIFACTS_DIR/plan.md
+  # This node copies plan.md → investigation.md when the plan path was taken
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md for implement step"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — implement may fail"
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: ADVERSARIAL IMPLEMENT (cross-model "different mind")
+  #   4a. negotiate-criteria  → derive acceptance contract    (mixed: kimi)
+  #   4b. init-impl-state     → state machine seed           (bash)
+  #   4c. adversarial-implement → generator ↔ evaluator loop
+  #         GENERATOR  (building)   → pi/zai/glm-5.2
+  #         EVALUATOR  (evaluating) → codex/gpt-5.4   (different mind)
+  # ═══════════════════════════════════════════════════════════════
+
+  # 4a-i. PROPOSER (glm): draft the acceptance contract from the issue + plan.
+  - id: negotiate-propose
+    provider: pi
+    model: zai/glm-5.2
+    prompt: |
+      You are the PROPOSER. Draft the acceptance CONTRACT for fixing this GitHub
+      issue. The contract is what an adversarial evaluator will later score the
+      implementation against, so it must be concrete, testable, and faithful to the
+      issue — NOT to whatever the implementer happens to build.
+
+      ## GitHub Issue
+
+      $fetch-issue.output
+
+      ## Classification
+
+      $classify.output
+
+      ## Investigation / Plan
+
+      Read `$ARTIFACTS_DIR/investigation.md` (it exists — it is either the bug
+      investigation or the bridged feature plan). Treat the issue body as the
+      AUTHORITATIVE spec; the investigation is the proposed approach.
+
+      ## Your task
+      Extract EVERY requirement the issue states: positive requirements (what must
+      happen), constraints (what must NOT happen / must stay unchanged), and edge
+      cases — each as its own first-class criterion. Propose 5-15. Each must be
+      concrete and verifiable (a command to run / output to inspect / file to read),
+      never "works correctly". You MAY read repo files to ground your `verify` steps.
+
+      Write `$ARTIFACTS_DIR/contracts/proposed.json` with the Write tool:
+      ```json
+      { "issue": "<number>",
+        "criteria": [ { "name": "kebab", "description": "...", "verify": "...", "threshold": 7 } ] }
+      ```
+      Return the same JSON as structured output.
+    depends_on: [bridge-artifacts]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+
+  # 4a-ii. ADVERSARY (m3, a DIFFERENT MODEL, fresh context): audit + emit final.
+  - id: negotiate-adversary-merge
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [negotiate-propose]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      You are the CRITERIA ADVERSARY — a DIFFERENT mind than the proposer. Find what
+      the proposed contract MISSES, then emit the FINAL merged contract. A shallow,
+      incomplete contract is how a PR silently drops part of the spec — close every hole.
+
+      Read:
+      - `$ARTIFACTS_DIR/issue.md` if present, otherwise treat the issue below as the
+        AUTHORITATIVE spec:
+
+        $fetch-issue.output
+
+      - `$ARTIFACTS_DIR/investigation.md` — the proposed approach (NOT authoritative).
+      - `$ARTIFACTS_DIR/contracts/proposed.json` — the proposer's draft (your target).
+      You MAY read repo files to ground checks.
+
+      ## Audit the draft against the issue (do ALL):
+      1. MISSING DELIVERABLES — every deliverable / constraint / "How to test" bullet
+         in the issue with NO matching criterion. Add one for each. Do not collapse
+         several into one.
+      2. WHOLE-SCOPE COVERAGE — for anything that must hold across MULTIPLE files (a
+         renamed/removed constant, a hardcoded value, a port), the `verify` must check
+         the ENTIRE affected directory, not just the headline file: require the new
+         token present AND the old/forbidden token absent
+         (e.g. `! git grep -n 'ttymxc4' -- bridge/ && git grep -q 'ttymxc0' -- bridge/`).
+      3. ANTI-THEATER — a criterion is satisfied only by CODE or observable behavior,
+         NEVER by a comment/docstring/PR text claiming it. Where a behavior is required,
+         `verify` must locate the actual call in source
+         (e.g. `git grep -n 'chmod' -- bridge/tty_bridge.py`), not a sentence.
+      4. HAPPY-PATH HOLES — reject any criterion a shallow one-file edit could pass
+         while leaving the rest of the scope stale; tighten it.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Add ONLY criteria grounded in the issue text. Do not invent requirements the
+      issue never states — that causes false rejections downstream.
+
+      ## Output
+      Write the FINAL merged contract to `$ARTIFACTS_DIR/contracts/impl.json` (union of
+      upheld proposed criteria + your additions, deduplicated, tightened):
+      ```json
+      {
+        "issue": "<number>",
+        "criteria": [
+          { "name": "short-kebab-name",
+            "description": "Specific, testable statement of what must be true",
+            "verify": "How an evaluator would check it (command to run, output to inspect, file to read)",
+            "threshold": 7 }
+        ]
+      }
+      ```
+      Also write `$ARTIFACTS_DIR/contracts/audit-notes.md` (what you UPHELD/TIGHTENED/
+      DROPPED and every criterion you ADDED, with why). Return the final contract JSON
+      as structured output.
+    output_format:
+      type: object
+      properties:
+        issue:
+          type: string
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              name:        { type: string }
+              description: { type: string }
+              verify:      { type: string }
+              threshold:   { type: number }
+            required: [name, description, verify, threshold]
+      required: [issue, criteria]
+
+  # 4b. Seed the implementation state machine.
+  - id: init-impl-state
+    depends_on: [negotiate-adversary-merge]
+    bash: |
+      mkdir -p "$ARTIFACTS_DIR/feedback"
+      cat > "$ARTIFACTS_DIR/impl-state.json" << 'STATEEOF'
+      {
+        "phase": "building",
+        "retry": 0,
+        "maxRetries": 3,
+        "passThreshold": 7,
+        "status": "running"
+      }
+      STATEEOF
+      echo "impl-state.json seeded"
+    timeout: 30000
+
+  # 4c. The adversarial implementation loop. UNLIKE the single-model variant, the
+  #     generator and evaluator run on DIFFERENT providers via loop.roleModels:
+  #     the builder is pi/kimi, the evaluator is codex/gpt-5.4. Each iteration also
+  #     gets a FRESH session (fresh_context), so the evaluator neither remembers
+  #     being the generator NOR shares its model's blind spots — a genuinely
+  #     independent adversary. The node-level provider/model below is only the
+  #     fallback used if the state file/field is missing.
+  - id: adversarial-implement
+    provider: pi
+    model: zai/glm-5.2
+    depends_on: [init-impl-state]
+    idle_timeout: 600000
+    loop:
+      # Per-role model selection: read `phase` from impl-state.json each iteration
+      # and run that role on its own provider/model. building = pi/kimi (builder),
+      # evaluating = codex/gpt-5.4 (different-mind adversary). Missing file/field on
+      # the first iteration falls back to `default` (the builder).
+      roleModels:
+        stateFile: $ARTIFACTS_DIR/impl-state.json
+        field: phase
+        map:
+          building:   { provider: pi,    model: zai/glm-5.2 }
+          evaluating: { provider: codex, model: gpt-5.4 }
+        default:      { provider: pi,    model: zai/glm-5.2 }
+      prompt: |
+        # Adversarial Implementation — Generator ↔ Evaluator (cross-model)
+
+        You play ONE role this iteration, determined by `phase` in the state file.
+        The generator and evaluator run on DIFFERENT models — you are whichever role
+        `phase` says, and your adversary is a different mind. The "app" is the REAL
+        repository worktree you are running in (current directory) — NOT a throwaway
+        sandbox. Changes you commit land on the issue branch and become the PR.
+
+        ## FIRST: Read State
+        Read `$ARTIFACTS_DIR/impl-state.json`:
+        - `phase` — "building" (Generator) or "evaluating" (Evaluator)
+        - `retry` — current retry attempt (0 = first try)
+        - `maxRetries` — max retries before giving up (default 3)
+        - `passThreshold` — minimum score to pass (default 7)
+
+        Then read:
+        - `$ARTIFACTS_DIR/contracts/impl.json` — the acceptance contract (authoritative)
+        - `$ARTIFACTS_DIR/investigation.md` — investigation / plan (the approach)
+
+        ---
+
+        ## ROLE: GENERATOR (phase = "building")
+
+        You are a software engineer implementing the fix so it SURVIVES an adversarial
+        evaluator — a DIFFERENT model — who will actively try to break it against every
+        contract criterion.
+
+        **If this is a RETRY (retry > 0):** read the most recent
+        `$ARTIFACTS_DIR/feedback/round-{retry-1}.json` and address EVERY failed
+        criterion. If scores were 5-6 and rising, refine; if 1-4 or fundamentally
+        wrong, pivot.
+
+        **Build rules:**
+        - Follow the investigation/plan, but the CONTRACT wins on conflicts.
+        - Honor the repo's conventions and any CLAUDE.md rules.
+        - Satisfy EVERY criterion in the contract — including constraints and edge
+          cases, not just the happy path. The evaluator will check all of them.
+        - Run the code yourself before committing. Verify each criterion's `verify`
+          step actually passes for you.
+        - Stage ONLY the files you edited — never `git add -A`/`.`/`-u`. Then commit:
+          `git add <file1> <file2> ... && git commit -m "fix: <what changed> (#<issue>)"`
+        - Do NOT stage anything under `$ARTIFACTS_DIR`, `*.scratch.md`, `*-report.md`.
+
+        **Write/refresh** `$ARTIFACTS_DIR/implementation.md` — files changed, tasks
+        done, how each contract criterion is satisfied, any deviations. (Downstream
+        PR creation reads this file, so it must always exist after you run.)
+
+        **Update impl-state.json:** set `"phase": "evaluating"`. Keep other fields.
+
+        ---
+
+        ## ROLE: EVALUATOR (phase = "evaluating")
+
+        You are an ADVERSARIAL QA agent, and a DIFFERENT model than the one that built
+        this. Your mandate is to BREAK the implementation. You are not helpful, not
+        generous — you are an attacker, and you do not share the builder's assumptions.
+
+        **CRITICAL CONSTRAINTS:**
+        - READ-ONLY on source. NEVER use Write/Edit on repository source files. (You
+          MAY write only to `$ARTIFACTS_DIR/feedback/`.)
+        - You MAY use Bash to run the app, run the test suite, diff outputs, probe edge
+          cases. Kill any background process you start before finishing.
+        - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/impl.json`. No skipping.
+
+        **Scoring:** 9-10 exceptional (handles unstated edges) · 7-8 solid (meets the
+        criterion) · 5-6 partial (core works, fails edges/has bugs) · 3-4 weak · 1-2
+        broken/absent. Do NOT grade on a curve. A 7 means "genuinely meets the bar."
+
+        **For each criterion:** read the relevant source, run its `verify` step, then
+        try to break it (invalid inputs, boundary values, error paths, and the
+        golden output if one exists). Score honestly.
+
+        **Write** `$ARTIFACTS_DIR/feedback/round-{retry}.json`:
+        ```json
+        {
+          "passed": <true iff ALL scores >= passThreshold>,
+          "scores": { "criterion-name": <score>, ... },
+          "feedback": [
+            { "criterion": "criterion-name", "score": <1-10>,
+              "details": "Specific findings: file:line, exact command run, exact output vs expected." }
+          ],
+          "overallSummary": "What works, what is broken, what the generator must fix."
+        }
+        ```
+
+        **Update impl-state.json by result:**
+        - PASSED (every score >= threshold): set `"status": "passed"`.
+        - FAILED & `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1.
+        - FAILED & `retry` >= `maxRetries`: set `"status": "exhausted"`.
+
+        Kill any background processes before finishing.
+
+        ---
+
+        ## COMPLETION
+        After updating impl-state.json, check `status`:
+        - `"passed"`    → Output: `<promise>IMPL_DONE</promise>`
+        - `"exhausted"` → the loop gave up; the latest implementation + feedback stand
+                          (downstream review/self-fix will still run). Output: `<promise>IMPL_DONE</promise>`
+        - `"running"`   → more work to do. Do NOT output any completion signal.
+
+      until: IMPL_DONE
+      max_iterations: 16
+      fresh_context: true
+      until_bash: |
+        grep -qE '"status"\s*:\s*"(passed|exhausted)"' "$ARTIFACTS_DIR/impl-state.json"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [adversarial-implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5b: PROJECT GATE (generic, data-driven — reads .archon/gates.json)
+  #   labeltool override: runs the repo's own gates (print-engine-unit-tests,
+  #   converter-unit-tests, converter-oracle). Each gate is path-scoped via
+  #   when_paths and runs only if the diff (BASE_BRANCH...HEAD) touches a match.
+  #   No gates.json → vacuous pass. Any selected gate exiting nonzero fails this
+  #   node, blocking create-pr and downstream. stdlib json + git only.
+  # ═══════════════════════════════════════════════════════════════
+  - id: project-gate
+    depends_on: [validate, resolve-base-branch]
+    bash: |
+      set -uo pipefail
+      [ -f .archon/gates.json ] || { echo "No .archon/gates.json — skipping project gate."; exit 0; }
+      BASE=$resolve-base-branch.output
+      echo "Project gate base: $BASE"
+      CHANGED=$(git diff --name-only "$BASE...HEAD")
+      echo "Changed files:"; echo "$CHANGED" | sed 's/^/  /'
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      "$PY" - "$CHANGED" << 'PYEOF'
+      import json, sys, subprocess, fnmatch, os
+      changed = [l for l in sys.argv[1].splitlines() if l.strip()]
+      gates = json.load(open(".archon/gates.json"))["gates"]
+      def hit(p):
+          # "*"/"**" => all; pattern without "/" => match basename; else full-path fnmatch
+          if p in ("*", "**"): return True
+          if "/" not in p: return any(fnmatch.fnmatch(os.path.basename(f), p) for f in changed)
+          return any(fnmatch.fnmatch(f, p) for f in changed)
+      failed = []
+      for g in gates:
+          if not any(hit(p) for p in g.get("when_paths", ["*"])):
+              print(f"[skip] {g['name']} (no matching changed paths)"); continue
+          print(f"[run ] {g['name']}: {g['run']}")
+          rc = subprocess.run(g["run"], shell=True).returncode
+          print(f"[{'pass' if rc == 0 else 'FAIL'}] {g['name']} (exit {rc})")
+          if rc != 0: failed.append(g["name"])
+      if failed:
+          print("PROJECT GATE FAILED:", ", ".join(failed)); sys.exit(1)
+      print("PROJECT GATE PASSED")
+      PYEOF
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE DRAFT PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request for the current branch.
+
+      ## Context
+
+      - **Issue**: $ARGUMENTS
+      - **Classification**: $classify.output
+      - **Issue title**: $classify.output.title
+
+      ## Instructions
+
+      1. Clean up runtime-generated files, then commit ONLY the implementation's own changes:
+         - Archon may sync its bundled default workflows into this worktree. Discard them so they never reach the PR:
+           `git checkout -- .archon/ 2>/dev/null; git clean -fd .archon/ 2>/dev/null`
+         - Run `git status`. The adversarial loop already committed the fix. If — and only if — source files the
+           implementation actually edited remain uncommitted, stage those specific files BY PATH and commit them.
+           NEVER use `git add -A` / `git add .` / `git add -u`, and never stage anything under `.archon/`,
+           `$ARTIFACTS_DIR`, `*.scratch.md`, or `*-report.md`.
+      2. Push the branch: `git push -u origin HEAD`
+      3. Read implementation artifacts from `$ARTIFACTS_DIR/` for context:
+         - `$ARTIFACTS_DIR/investigation.md` or `$ARTIFACTS_DIR/plan.md`
+         - `$ARTIFACTS_DIR/implementation.md`
+         - `$ARTIFACTS_DIR/contracts/impl.json` (acceptance contract) and the latest `$ARTIFACTS_DIR/feedback/round-*.json` (adversarial verdict)
+         - `$ARTIFACTS_DIR/validation.md`
+      4. Check if a PR already exists for this branch: `gh pr list --head $(git branch --show-current)`
+         - If PR exists, skip creation and capture its number
+      5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
+      6. Create a DRAFT PR: `gh pr create --draft --base $resolve-base-branch.output`
+         - Title: concise, imperative mood, under 70 chars
+         - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, validation evidence, the adversarial acceptance verdict (which criteria passed and final scores), and `Fixes #...`.
+         - Link to issue: include `Fixes #...` or `Closes #...`
+      7. Capture PR identifiers:
+         ```bash
+         PR_NUMBER=$(gh pr view --json number -q '.number')
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         PR_URL=$(gh pr view --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [project-gate, resolve-base-branch]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: REVIEW — transplanted from archonx-pr-review-m3.m3
+  #   M3 per-file ATTACK+VERIFY review (pass 1) + a SECOND M3 mind adversarially
+  #   audits it (pass 2) for MISSES and FALSE POSITIVES. M2.7 under-detects, so M3
+  #   sits on BOTH review seats. All M3 calls are bounded to ONE changed file per
+  #   iteration so no single pi->MiniMax request hits the ~500s request timeout,
+  #   and the audit has a resume + all_done report for timeout resilience.
+  #   Output: $ARTIFACTS_DIR/review/consolidated-review.md (incl. [ADVERSARIAL]
+  #   net-new findings) — consumed by self-fix downstream.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [create-pr]
+    context: fresh
+
+  - id: review-sync
+    command: archon-sync-pr-with-main
+    depends_on: [review-scope]
+
+  # ── Enumerate changed files into a work queue shared by both M3 passes ──
+  - id: enumerate-files
+    depends_on: [review-sync]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/review/deep" "$ARTIFACTS_DIR/review/audit"
+      # Resolve PR number robustly — do NOT trust the M2.7 scope node to have written
+      # .pr-number (it flakes: its bash tool can fail silently, leaving the file empty,
+      # which makes the gh-pr-view-on-current-branch fallback resolve to the review's OWN
+      # worktree branch -> empty diff -> false APPROVE). Order: scope artifact (only if a
+      # real integer) -> first #<n> / number in the run ARGUMENTS -> gh pr view on branch.
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
+      fi
+      if [ -z "$PR_NUMBER" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+      fi
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        echo "FATAL: could not resolve PR number (scope=empty, ARGUMENTS=${ARGUMENTS:-}, branch has no PR)" >&2
+        exit 1
+      fi
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+      echo "enumerate-files: resolved PR #$PR_NUMBER"
+      BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      git fetch origin "$BASE" --quiet || true
+      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" | { grep -vE '^[.]archive/' || true; } > "$ARTIFACTS_DIR/review/files.txt"
+      : > "$ARTIFACTS_DIR/review/reviewed.txt"
+      : > "$ARTIFACTS_DIR/review/audited.txt"
+      TOTAL=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0; } | tail -1 )
+      echo "M3.M3 queue: $TOTAL changed file(s) vs origin/$BASE"
+      cat "$ARTIFACTS_DIR/review/files.txt" | sed 's/^/  /'
+
+  # ── PASS 1 — M3 reviewer: one file per iteration, ATTACK + VERIFY, all aspects ──
+  - id: m3-review
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [enumerate-files]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # M3 Review (pass 1) — pick the next unreviewed file and review ONLY that file
+
+        TIMEOUT DISCIPLINE: review exactly ONE file this iteration. Be thorough but CONCISE —
+        no preamble, no restating the diff; go straight to findings. This keeps the request short.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>REVIEW_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Context (read only what you need for FILE)
+        - `$ARTIFACTS_DIR/review/scope.md`
+        - The change: `BASE=$(gh pr view $(cat $ARTIFACTS_DIR/.pr-number) --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD" -- "FILE"`
+        - The current full contents of FILE.
+
+        ## Two framings (run BOTH, union findings)
+        1. ATTACK — assume a bug EXISTS; construct a concrete counterexample (run code/tests if cheap).
+        2. VERIFY — try to PROVE each changed line correct; where you can't, that's a finding.
+
+        ## Aspects (every one): correctness/logic · error-handling · test coverage (would the
+        tests fail if the code were wrong?) · comment/docstring accuracy · docs impact ·
+        security · performance · concurrency/shared-state.
+
+        ## Write findings to `$ARTIFACTS_DIR/review/deep/$(echo FILE | tr '/.' '__').md`:
+        ```markdown
+        # M3 review: FILE
+        ## [SEVERITY] Title   (CRITICAL|HIGH|MEDIUM|LOW)
+        - **Location**: FILE:line
+        - **Framing**: attack|verify
+        - **Aspect**: ...
+        - **Evidence**: exact reasoning / command / output vs expected
+        - **Fix**: concise fix
+        ```
+        If clean, write a one-line "no findings" note with why.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/reviewed.txt"
+        ```
+        Then if files remain, emit NOTHING (loop continues); if none remain, output `<promise>REVIEW_DONE</promise>`.
+      until: REVIEW_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Aggregate pass-1 findings + post a first comment (cheap model; mechanical) ──
+  - id: review-synthesize
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [m3-review]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Aggregate the M3 pass-1 per-file findings into one report.
+
+      Read every `$ARTIFACTS_DIR/review/deep/*.md`. Combine, DEDUPLICATE (same file:line + claim
+      = one), order by severity. Write `$ARTIFACTS_DIR/review/consolidated-review.md` with an
+      executive summary, a verdict (APPROVE | REQUEST_CHANGES | NEEDS_DISCUSSION), a severity
+      count table, then a section per severity. For each CRITICAL/HIGH use exactly:
+      ```
+      ### {Title}
+      **Location**: `{file}:{line}`
+      **Problem**: {what's wrong}
+      **Recommended Fix**: {fix}
+      **Why**: {impact}
+      ```
+      MEDIUM/LOW in brief tables. Then post it:
+      ```bash
+      PR=$(cat $ARTIFACTS_DIR/.pr-number)
+      gh pr comment "$PR" --body "$(cat $ARTIFACTS_DIR/review/consolidated-review.md)"
+      ```
+      Output a one-line confirmation only.
+
+  # ── PASS 2 — M3 adversary: a SECOND M3 mind audits pass-1, one file per iteration ──
+  - id: m3-audit
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [review-synthesize]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # M3 Adversarial Audit (pass 2) — you are a DIFFERENT M3 mind auditing the first M3
+
+        TIMEOUT DISCIPLINE: audit exactly ONE file this iteration; be terse; no preamble.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/audited.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>AUDIT_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Read
+        - The pass-1 findings for FILE in `$ARTIFACTS_DIR/review/consolidated-review.md`
+          (these are the FIRST M3's claims — your exclusion list AND your target).
+        - The change: `BASE=$(gh pr view $(cat $ARTIFACTS_DIR/.pr-number) --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD" -- "FILE"` and FILE's full contents.
+
+        ## Your job — dialectic against the first M3 (do BOTH):
+        1. MISSES — find NET-NEW issues the first M3 did not report for FILE. Substantiate with
+           file:line + concrete evidence (run code/tests if cheap). Duplicates of pass-1 = failure.
+        2. FALSE POSITIVES / OVERREACH — for each pass-1 finding on FILE, judge whether it actually
+           holds. If a pass-1 CRITICAL/HIGH is wrong or overstated, say so with evidence.
+
+        ## Write to `$ARTIFACTS_DIR/review/audit/$(echo FILE | tr '/.' '__').md`:
+        ```markdown
+        # M3 audit: FILE
+        ## NET-NEW
+        ## [SEVERITY] Title  — Location FILE:line — Evidence — Fix
+        ## REBUTTALS
+        - {pass-1 finding} -> UPHELD | REFUTED ({evidence})
+        ```
+        For every NET-NEW CRITICAL/HIGH, ALSO append it (prefixed `[ADVERSARIAL]`) to the matching
+        severity section of `$ARTIFACTS_DIR/review/consolidated-review.md`, same
+        Title/Location/Problem/Recommended Fix/Why structure, so it survives even if a later
+        iteration times out.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/audited.txt"
+        ```
+        Then if files remain, emit NOTHING; if none remain, output `<promise>AUDIT_DONE</promise>`.
+      until: AUDIT_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Resilience: if m3-audit timed out mid-queue (e.g. 3/8 done), resume the rest ──
+  # Runs even when m3-audit FAILED (all_done). Emits exactly MORE or DONE (nothing else),
+  # so the resume loop's `when:` can gate cleanly. trailing newline is trimmed by Archon.
+  - id: audit-status
+    depends_on: [m3-audit]
+    trigger_rule: all_done
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+      done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
+      if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
+
+  # Only runs when files remain unaudited (when == MORE). If audit finished 8/8 -> SKIPPED
+  # (no M3 call). Identical per-file audit; resumes from audited.txt where the timeout left off.
+  - id: m3-audit-resume
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [audit-status]
+    when: "$audit-status.output == 'MORE'"
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # M3 Adversarial Audit (RESUME) — finish the files the timed-out audit didn't reach
+
+        TIMEOUT DISCIPLINE: audit exactly ONE file this iteration; be terse; no preamble.
+
+        ## Pick your file (next file in files.txt not yet in audited.txt)
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/audited.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>AUDIT_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Read
+        - The pass-1 findings for FILE in `$ARTIFACTS_DIR/review/consolidated-review.md`.
+        - The change: `BASE=$(gh pr view $(cat $ARTIFACTS_DIR/.pr-number) --json baseRefName -q .baseRefName); git diff "origin/$BASE...HEAD" -- "FILE"` and FILE's full contents.
+
+        ## Your job (do BOTH):
+        1. MISSES — net-new issues the first M3 did not report for FILE (file:line + evidence).
+        2. FALSE POSITIVES — judge each pass-1 finding on FILE: UPHELD or REFUTED, with evidence.
+
+        ## Write to `$ARTIFACTS_DIR/review/audit/$(echo FILE | tr '/.' '__').md` (NET-NEW + REBUTTALS,
+        same format as the main audit). For every NET-NEW CRITICAL/HIGH, append it prefixed
+        `[ADVERSARIAL]` to the matching severity section of consolidated-review.md.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/audited.txt"
+        ```
+        Then if files remain, emit NOTHING; if none remain, output `<promise>AUDIT_DONE</promise>`.
+      until: AUDIT_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/audited.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Final review report — all_done so it publishes whether the audit/resume completed, skipped, or failed ──
+  - id: review-report
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [m3-audit-resume]
+    trigger_rule: all_done
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Finalize the M3.M3 review. The audit pass MAY have ended early (timeout) — work with
+      whatever exists; do not assume it completed.
+
+      1. Read `$ARTIFACTS_DIR/review/consolidated-review.md` (now includes any `[ADVERSARIAL]`
+         net-new findings appended by the audit) and every `$ARTIFACTS_DIR/review/audit/*.md`.
+      2. Count files audited vs total:
+         `t=$(grep -c . $ARTIFACTS_DIR/review/files.txt); a=$(grep -c . $ARTIFACTS_DIR/review/audited.txt 2>/dev/null||echo 0); echo "$a/$t audited"`.
+      3. Post ONE final PR comment summarizing: total findings by severity (pass 1 + audit
+         net-new), how many files the audit covered (flag if incomplete due to timeout), and a
+         short list of pass-1 findings the adversary REFUTED. Then the final verdict.
+      ```bash
+      PR=$(cat $ARTIFACTS_DIR/.pr-number)
+      gh pr comment "$PR" --body "$(cat $ARTIFACTS_DIR/review/final-summary.md)"
+      ```
+      Write that summary to `$ARTIFACTS_DIR/review/final-summary.md` first. Output a brief confirmation.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: SELF-FIX
+  #   mixed: self-fix on pi/zai/glm-5.2
+  #   Consumes the M3.M3 consolidated-review.md (incl. [ADVERSARIAL] net-new findings).
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: self-fix
+    provider: pi
+    model: zai/glm-5.2
+    command: archon-self-fix-all
+    depends_on: [review-report]
+    trigger_rule: all_done
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: SIMPLIFY
+  #   mixed: simplify on pi/zai/glm-5.2
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    provider: pi
+    model: zai/glm-5.2
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 10: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [simplify]
+    context: fresh

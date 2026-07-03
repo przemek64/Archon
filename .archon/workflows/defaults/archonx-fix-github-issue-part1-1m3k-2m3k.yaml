@@ -1,0 +1,655 @@
+name: archonx-fix-github-issue-part1-1m3k-2m3k
+description: |
+  Use when: You want to FIX a GitHub issue but with the monolith split into 3
+  independently-runnable PARTS (plan -> implement -> review). This is PART 1 of 3:
+  classify + research + investigate/plan (KIMI) + a bounded adversarial AUDIT of
+  that plan/investigation (M3 adversary) + adversarial negotiate (kimi proposer ->
+  M3 adversary). It FREEZES the plan and the acceptance contract onto a
+  deterministic shared branch and STOPS — part2 implements, part3 reviews.
+  Triggers: "fix issue part1 1km3 #123", "kimi plan+contract for #123".
+  NOT for: One-shot end-to-end fixes (use the monolith), questions, PR reviews.
+
+  ── WHAT'S DIFFERENT vs part1-1c-2gm3 ─────────────────────────────────────────
+  "1km3": the plan/investigation is produced by KIMI, then a DIFFERENT mind (M3)
+  adversarially audits it for missing requirements / dropped constraints / unhandled
+  edge cases / wrong assumptions / bad sequencing, kimi revises, M3 re-checks, and
+  kimi does a 2nd revise ONLY IF an unresolved HIGH finding remains (bounded: max 2
+  revise rounds). This hardens the plan BEFORE it becomes the contract — closing the
+  plan-phase-adversary gap (memory project_plan_adversary_idea).
+  "2km3": negotiate PROPOSER is kimi (was glm); adversary stays M3.
+
+  ── SPLIT DESIGN (memory project_split_fix_workflow, Spec A) ───────────────────
+  Archon has NO sub-workflow node, so the 3 parts are SEPARATE `workflow run`
+  invocations linked by a DETERMINISTIC shared branch:  archon/fix-issue-<N>-kimi.
+  Handoff is LOCAL-ONLY (no push between parts): all 3 parts must run in the SAME
+  git checkout. part1 creates the shared branch ref locally (does NOT check it out),
+  stores the frozen artifacts in an orphan commit under refs/archon-run/issue-<N>-kimi,
+  and stops.
+
+  NOTE: this part1 uses the -kimi suffix, so it requires -kimi variants of part2/part3
+  to consume it (the shipped part2-3gc / part3-4m3m3g read the -glm suffix).
+
+  Frozen by this part (read by part2):
+    - .archon-run/issue-<N>/plan.md            (investigation or bridged plan, hardened)
+    - .archon-run/issue-<N>/contracts/impl.json (the acceptance contract — AUTHORITATIVE)
+    - .archon-run/issue-<N>/base-branch         (resolved PR base, so parts agree)
+
+  Model routing (this part):
+    - investigate / plan + revisions -> pi/minimax/MiniMax-M3
+    - plan/investigation ADVERSARY   -> pi/kimi-coding/kimi-for-coding
+    - negotiate PROPOSER             -> pi/minimax/MiniMax-M3
+    - negotiate ADVERSARY (merge)    -> pi/kimi-coding/kimi-for-coding
+    - everything else trivial        -> pi/MiniMax-M2.7
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If the message is ambiguous (e.g., "fix the SQLite timestamp bug"), use `gh issue list` to search for matching issues and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+
+  - id: fetch-issue
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      # Strip quotes, whitespace, markdown backticks from AI output
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number from: $extract-issue-number.output" >&2
+        exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+
+  # Derive the PR base branch from the issue's `target:` label.
+  #   no label / "target: main" -> main ;  "target: <x>" -> feat/<x>
+  - id: resolve-base-branch
+    depends_on: [extract-issue-number, fetch-issue]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      ISSUE_NUM=$(echo $extract-issue-number.output | grep -oE '[0-9]+' | head -1)
+      TARGET=$(gh issue view "$ISSUE_NUM" --json labels -q '[.labels[].name | select(startswith("target: "))][0] // ""' | sed 's/^target: //')
+      if [ -z "$TARGET" ] || [ "$TARGET" = "main" ]; then BR="main"; else BR="feat/$TARGET"; fi
+      if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: base '$BR' (target='${TARGET:-none}') not on origin" >&2; exit 1
+      fi
+      # Repoint the worktree onto the resolved base BEFORE any node reads or writes
+      # code, so investigation/planning see the correct tree. Guard refuses to repoint
+      # if uncommitted changes are present, in case the DAG is ever reordered.
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "resolve-base-branch: uncommitted changes present; refusing destructive repoint" >&2; exit 1
+      fi
+      if ! git fetch origin "$BR" --quiet; then
+        echo "resolve-base-branch: fetch origin/$BR failed" >&2; exit 1
+      fi
+      if ! git reset --hard "origin/$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: reset to origin/$BR failed" >&2; exit 1
+      fi
+      echo "resolve-base-branch -> $BR (worktree repointed)" >&2
+      printf '%s' "$BR"
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below and determine its type.
+
+      ## Issue Content
+
+      $fetch-issue.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | "add", "new", "support", "would be nice", net-new capability |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-issue]
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3a: INVESTIGATE branch (bugs) — kimi produce, M3 adversary, bounded 2 rounds
+  #   produces / hardens $ARTIFACTS_DIR/investigation.md
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    provider: pi
+    model: minimax/MiniMax-M3
+    command: archon-investigate-issue
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: investigate-audit
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [investigate]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the INVESTIGATION ADVERSARY — a DIFFERENT mind than the investigator.
+      You audit the bug investigation BEFORE it becomes an acceptance contract and a
+      fix. A weak investigation is how a PR fixes the wrong thing or misses a case.
+
+      ## GitHub Issue (AUTHORITATIVE problem statement)
+
+      $fetch-issue.output
+
+      Read `$ARTIFACTS_DIR/investigation.md` and the GitHub issue above IN FULL — that
+      pairing is your PRIMARY evidence. Audit investigation-vs-issue first.
+
+      ## REPO-READ BUDGET (hard cap — you will time out otherwise)
+      You MAY open AT MOST 6 repo files, and ONLY to confirm a SPECIFIC suspected HIGH
+      finding (e.g. a diagnosed root-cause file:line you doubt). Do NOT survey the tree
+      or ground MED/LOW findings against the repo. Spend your time reasoning, not
+      exploring.
+
+      ## Audit the investigation (do ALL):
+      1. ROOT CAUSE — is the diagnosed cause actually proven against the code, or
+         asserted? Name the file:line that proves or disproves it. Flag guesses.
+      2. REPRODUCTION — is there a concrete, runnable repro? If absent or vague, flag.
+      3. SCOPE / COMPLETENESS — does the same defect exist in sibling code paths the
+         investigation ignored (other call sites, other modes/files)? Flag misses.
+      4. EDGE CASES & FAILURE MODES — boundary values, error paths, CRLF/encoding,
+         idempotency, retries, concurrency — implied by the issue but unaddressed.
+      5. WRONG/UNSTATED ASSUMPTIONS — anything the investigation assumes that the
+         code or issue contradicts.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Only raise findings grounded in the issue text or the actual repo. Do not invent
+      requirements the issue never implies.
+
+      ## Output
+      Write `$ARTIFACTS_DIR/investigate-audit.md`: a numbered findings list. For each
+      finding give SEVERITY (HIGH = would cause a wrong/incomplete fix; MED = real gap,
+      should fix; LOW = nit), the specific evidence (file:line / command+output), and
+      what the investigation must add or correct.
+      Then return structured output.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        high_count:
+          type: number
+        med_count:
+          type: number
+        summary:
+          type: string
+      required: [unresolved_high, high_count, med_count, summary]
+
+  - id: investigate-revise
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [investigate-audit]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the investigator, hardening your own analysis against an adversary.
+
+      The GitHub issue is the AUTHORITATIVE problem statement:
+
+      $fetch-issue.output
+
+      Read your current `$ARTIFACTS_DIR/investigation.md` and the adversary's findings
+      in `$ARTIFACTS_DIR/investigate-audit.md`.
+
+      Address EVERY HIGH and MED finding: prove the root cause against the code, add a
+      concrete repro, widen scope to the sibling paths/edge cases the adversary named.
+      Rewrite `$ARTIFACTS_DIR/investigation.md` in place with the corrected, more
+      complete analysis. If you deliberately REJECT a finding, keep it but add a
+      one-line justification grounded in the issue/code.
+
+      Append a `## Revision log (round 1)` section listing what you changed and what
+      you rejected and why.
+
+  - id: investigate-recheck
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [investigate-revise]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the INVESTIGATION ADVERSARY re-checking the revised analysis (round 2).
+
+      The GitHub issue (AUTHORITATIVE):
+
+      $fetch-issue.output
+
+      Read the revised `$ARTIFACTS_DIR/investigation.md` and your prior
+      `$ARTIFACTS_DIR/investigate-audit.md`. For each prior HIGH/MED finding decide
+      RESOLVED / PARTIAL / UNRESOLVED with evidence. Do not open new lines of attack
+      unless they are HIGH severity grounded in the issue.
+
+      Write `$ARTIFACTS_DIR/investigate-recheck.md` with the verdict per finding, then
+      return structured output. Set unresolved_high="true" ONLY if a HIGH finding
+      remains genuinely unaddressed.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        summary:
+          type: string
+      required: [unresolved_high, summary]
+
+  # 2nd revise — runs ONLY if a HIGH finding survived the re-check (bounded last round).
+  # The issue_type guard MUST come first: AND short-circuits, so on the feature branch
+  # (recheck skipped) the $investigate-recheck.output ref is never resolved → no
+  # OutputRefError. (condition-evaluator: compound AND, left-to-right short-circuit.)
+  - id: investigate-revise-2
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [investigate-recheck]
+    when: "$classify.output.issue_type == 'bug' && $investigate-recheck.output.unresolved_high == 'true'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      Final bounded revision. The adversary's re-check
+      (`$ARTIFACTS_DIR/investigate-recheck.md`) still reports an unresolved HIGH.
+      The GitHub issue (AUTHORITATIVE):
+
+      $fetch-issue.output
+
+      Read the re-check plus `$ARTIFACTS_DIR/investigation.md`. Resolve the remaining
+      HIGH finding(s) and rewrite `investigation.md` in place. Append a
+      `## Revision log (round 2)` section. This is the last revision round.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3b: PLAN branch (features/etc) — kimi produce, M3 adversary, bounded 2 rounds
+  #   produces / hardens $ARTIFACTS_DIR/plan.md
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: plan
+    provider: pi
+    model: minimax/MiniMax-M3
+    command: archon-create-plan
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  - id: plan-audit
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [plan]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the PLAN ADVERSARY — a DIFFERENT mind than the planner. You audit the
+      implementation PLAN before it becomes an acceptance contract and code. A plan
+      with holes is how a PR silently drops part of the spec or builds the wrong thing.
+
+      ## GitHub Issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read `$ARTIFACTS_DIR/plan.md` and the GitHub issue above IN FULL — that pairing
+      is your PRIMARY evidence and needs zero repo access. Audit plan-vs-issue first.
+
+      ## REPO-READ BUDGET (hard cap — you will time out otherwise)
+      You MAY open AT MOST 6 repo files, and ONLY to confirm a SPECIFIC suspected HIGH
+      finding (e.g. a file:line the plan cites that you doubt). Do NOT read the plan's
+      "Mandatory Reading" list, do NOT survey the tree, do NOT ground MED/LOW findings
+      against the repo. A gap between the plan and the issue text is a finding on its
+      own and needs no file read. Spend your time reasoning, not exploring.
+
+      ## Audit the plan (do ALL):
+      1. MISSING REQUIREMENTS — every deliverable / constraint / "How to test" bullet
+         in the issue with NO corresponding step in the plan. Flag each.
+      2. CONSTRAINTS DROPPED — "must NOT change" / "stays unchanged" / invariants the
+         plan would violate or ignores.
+      3. EDGE CASES & FAILURE MODES — boundary values, error/retry paths, idempotency,
+         ordering, CRLF/encoding, concurrency — implied by the issue but unplanned.
+      4. WRONG ASSUMPTIONS — steps that assume something the code/issue contradicts.
+      5. AMBIGUITY — steps too vague to implement or verify deterministically.
+      6. SEQUENCING — steps in an order that cannot work (relies on output an earlier
+         step never produces).
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Only raise findings grounded in the issue text or the actual repo. Do not invent
+      requirements the issue never states.
+
+      ## Output
+      Write `$ARTIFACTS_DIR/plan-audit.md`: a numbered findings list. For each finding
+      give SEVERITY (HIGH = would cause a wrong/incomplete implementation; MED = real
+      gap, should fix; LOW = nit), specific evidence (issue bullet / file:line), and
+      what the plan must add or correct.
+      Then return structured output.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        high_count:
+          type: number
+        med_count:
+          type: number
+        summary:
+          type: string
+      required: [unresolved_high, high_count, med_count, summary]
+
+  - id: plan-revise
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [plan-audit]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the planner, hardening your own plan against an adversary.
+
+      ## GitHub Issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read your current `$ARTIFACTS_DIR/plan.md` and the adversary's findings in
+      `$ARTIFACTS_DIR/plan-audit.md`.
+
+      Address EVERY HIGH and MED finding: add the missing steps, restore dropped
+      constraints, plan the edge cases, fix sequencing, disambiguate. Rewrite
+      `$ARTIFACTS_DIR/plan.md` in place with the corrected, more complete plan. If you
+      deliberately REJECT a finding, keep it but add a one-line justification grounded
+      in the issue/code.
+
+      Append a `## Revision log (round 1)` section listing what you changed and what
+      you rejected and why.
+
+  - id: plan-recheck
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [plan-revise]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the PLAN ADVERSARY re-checking the revised plan (round 2).
+
+      ## GitHub Issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read the revised `$ARTIFACTS_DIR/plan.md` and your prior
+      `$ARTIFACTS_DIR/plan-audit.md`. For each prior HIGH/MED finding decide RESOLVED /
+      PARTIAL / UNRESOLVED with evidence. Do not open new lines of attack unless they
+      are HIGH severity grounded in the issue.
+
+      Write `$ARTIFACTS_DIR/plan-recheck.md` with the verdict per finding, then return
+      structured output. Set unresolved_high="true" ONLY if a HIGH finding remains
+      genuinely unaddressed.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        summary:
+          type: string
+      required: [unresolved_high, summary]
+
+  # 2nd revise — runs ONLY if a HIGH finding survived the re-check (bounded last round).
+  # issue_type guard first (AND short-circuit) so the bug branch never resolves
+  # $plan-recheck.output (skipped) → no OutputRefError.
+  - id: plan-revise-2
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [plan-recheck]
+    when: "$classify.output.issue_type != 'bug' && $plan-recheck.output.unresolved_high == 'true'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      Final bounded revision. The adversary's re-check
+      (`$ARTIFACTS_DIR/plan-recheck.md`) still reports an unresolved HIGH.
+      The GitHub issue (AUTHORITATIVE spec):
+
+      $fetch-issue.output
+
+      Read the re-check plus `$ARTIFACTS_DIR/plan.md`. Resolve the remaining HIGH
+      finding(s) and rewrite `plan.md` in place. Append a `## Revision log (round 2)`
+      section. This is the last revision round.
+
+  # Bridge: ensure investigation.md exists (plan path writes plan.md).
+  #   Depends on the always-run tail of BOTH branches (recheck) plus the conditional
+  #   2nd-revise nodes, so it runs after the WHOLE active branch settles regardless of
+  #   whether revise-2 fired (layered execution guarantees bridge is in a later layer).
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — negotiate may fail"
+      fi
+    depends_on: [investigate-recheck, investigate-revise-2, plan-recheck, plan-revise-2]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: NEGOTIATE (two-seat, cross-model)
+  #   PROPOSER  kimi -> drafts contract
+  #   ADVERSARY m3   -> audits + emits FINAL merged contract
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: negotiate-propose
+    provider: pi
+    model: minimax/MiniMax-M3
+    prompt: |
+      You are the PROPOSER. Draft the acceptance CONTRACT for fixing this GitHub
+      issue. The contract is what an adversarial evaluator will later score the
+      implementation against, so it must be concrete, testable, and faithful to the
+      issue — NOT to whatever the implementer happens to build.
+
+      ## GitHub Issue
+
+      $fetch-issue.output
+
+      ## Classification
+
+      $classify.output
+
+      ## Investigation / Plan
+
+      Read `$ARTIFACTS_DIR/investigation.md` (it exists — it is either the hardened bug
+      investigation or the bridged hardened feature plan). Treat the issue body as the
+      AUTHORITATIVE spec; the investigation is the proposed approach.
+
+      ## Your task
+      Extract EVERY requirement the issue states: positive requirements (what must
+      happen), constraints (what must NOT happen / must stay unchanged), and edge
+      cases — each as its own first-class criterion. Propose 5-15. Each must be
+      concrete and verifiable (a command to run / output to inspect / file to read),
+      never "works correctly". You MAY read repo files to ground your `verify` steps.
+
+      Write `$ARTIFACTS_DIR/contracts/proposed.json` with the Write tool:
+      ```json
+      { "issue": "<number>",
+        "criteria": [ { "name": "kebab", "description": "...", "verify": "...", "threshold": 7 } ] }
+      ```
+      Return the same JSON as structured output.
+    depends_on: [bridge-artifacts]
+    context: fresh
+    allowed_tools: [Read, Write, Grep, Bash]
+
+  - id: negotiate-adversary-merge
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [negotiate-propose]
+    context: fresh
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the CRITERIA ADVERSARY — a DIFFERENT mind than the proposer. Find what
+      the proposed contract MISSES, then emit the FINAL merged contract. A shallow,
+      incomplete contract is how a PR silently drops part of the spec — close every hole.
+
+      Read:
+      - `$ARTIFACTS_DIR/issue.md` if present, otherwise treat the issue below as the
+        AUTHORITATIVE spec:
+
+        $fetch-issue.output
+
+      - `$ARTIFACTS_DIR/investigation.md` — the proposed approach (NOT authoritative).
+      - `$ARTIFACTS_DIR/contracts/proposed.json` — the proposer's draft (your target).
+
+      ## REPO-READ BUDGET (hard cap — you will time out otherwise)
+      Your job is issue-vs-contract completeness, which needs no repo access. You MAY
+      open AT MOST 6 repo files, and ONLY to make a specific `verify` command concrete
+      (e.g. confirm a path/token exists so the grep is right). Do NOT survey the tree.
+
+      ## Audit the draft against the issue (do ALL):
+      1. MISSING DELIVERABLES — every deliverable / constraint / "How to test" bullet
+         in the issue with NO matching criterion. Add one for each. Do not collapse
+         several into one.
+      2. WHOLE-SCOPE COVERAGE — for anything that must hold across MULTIPLE files (a
+         renamed/removed constant, a hardcoded value, a port), the `verify` must check
+         the ENTIRE affected directory, not just the headline file: require the new
+         token present AND the old/forbidden token absent
+         (e.g. `! git grep -n 'ttymxc4' -- bridge/ && git grep -q 'ttymxc0' -- bridge/`).
+      3. ANTI-THEATER — a criterion is satisfied only by CODE or observable behavior,
+         NEVER by a comment/docstring/PR text claiming it. Where a behavior is required,
+         `verify` must locate the actual call in source
+         (e.g. `git grep -n 'chmod' -- bridge/tty_bridge.py`), not a sentence.
+      4. HAPPY-PATH HOLES — reject any criterion a shallow one-file edit could pass
+         while leaving the rest of the scope stale; tighten it.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Add ONLY criteria grounded in the issue text. Do not invent requirements the
+      issue never states — that causes false rejections downstream.
+
+      ## Output
+      Write the FINAL merged contract to `$ARTIFACTS_DIR/contracts/impl.json` (union of
+      upheld proposed criteria + your additions, deduplicated, tightened):
+      ```json
+      {
+        "issue": "<number>",
+        "criteria": [
+          { "name": "short-kebab-name",
+            "description": "Specific, testable statement of what must be true",
+            "verify": "How an evaluator would check it (command to run, output to inspect, file to read)",
+            "threshold": 7 }
+        ]
+      }
+      ```
+      Also write `$ARTIFACTS_DIR/contracts/audit-notes.md` (what you UPHELD/TIGHTENED/
+      DROPPED and every criterion you ADDED, with why). Return the final contract JSON
+      as structured output.
+    output_format:
+      type: object
+      properties:
+        issue:
+          type: string
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              name:        { type: string }
+              description: { type: string }
+              verify:      { type: string }
+              threshold:   { type: number }
+            required: [name, description, verify, threshold]
+      required: [issue, criteria]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: FREEZE — store plan + contract under a SIDE REF and STOP
+  #   Identical mechanism to part1-1c-2gm3 but with the -kimi suffix. The handoff is
+  #   an ORPHAN commit under refs/archon-run/issue-<N>-kimi (NOT on the work branch,
+  #   so .archon-run/ cannot leak into part2's PR). The work branch
+  #   archon/fix-issue-<N>-kimi is set to the CLEAN base tip and NOT checked out, so a
+  #   -kimi part2 can claim it. Local-only: nothing pushed.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: freeze
+    depends_on: [negotiate-adversary-merge, resolve-base-branch]
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$N" ]; then echo "freeze: could not resolve issue number" >&2; exit 1; fi
+      BASE=$(printf '%s' "$resolve-base-branch.output" | tr -d ' \n')
+      [ -n "$BASE" ] || BASE=main
+      BR="archon/fix-issue-$N-m3k"
+      REF="refs/archon-run/issue-$N-m3k"
+
+      [ -f "$ARTIFACTS_DIR/contracts/impl.json" ] || { echo "freeze: contracts/impl.json missing — negotiate failed" >&2; exit 1; }
+      [ -f "$ARTIFACTS_DIR/investigation.md" ]     || { echo "freeze: investigation.md missing" >&2; exit 1; }
+
+      git config user.email  >/dev/null 2>&1 || git config user.email "archon@local"
+      git config user.name   >/dev/null 2>&1 || git config user.name  "Archon"
+
+      # Stage the handoff files into a TEMP index (never touches the work tree/branch),
+      # then build an orphan (parentless) commit and stash it under the side ref.
+      STAGE=$(mktemp -d)
+      printf '%s' "$BASE" > "$STAGE/base-branch"
+      add_blob() {  # $1 = src file on disk, $2 = path inside the handoff tree
+        [ -f "$1" ] || return 0
+        local blob; blob=$(git hash-object -w "$1")
+        git update-index --add --cacheinfo "100644,$blob,$2"
+      }
+      export GIT_INDEX_FILE="$STAGE/index"
+      git read-tree --empty
+      add_blob "$ARTIFACTS_DIR/investigation.md"          ".archon-run/issue-$N/plan.md"
+      add_blob "$ARTIFACTS_DIR/contracts/impl.json"       ".archon-run/issue-$N/contracts/impl.json"
+      add_blob "$ARTIFACTS_DIR/contracts/audit-notes.md"  ".archon-run/issue-$N/contracts/audit-notes.md"
+      add_blob "$STAGE/base-branch"                       ".archon-run/issue-$N/base-branch"
+      TREE=$(git write-tree)
+      HANDOFF=$(git commit-tree "$TREE" -m "archon handoff for #$N [part1-m3k]")
+      unset GIT_INDEX_FILE
+      git update-ref "$REF" "$HANDOFF"
+
+      # Work branch = CLEAN base tip (HEAD is origin/$BASE after resolve-base-branch),
+      # created WITHOUT checking it out so part2 can claim it.
+      git branch -f "$BR" HEAD
+      echo "part1 froze handoff for #$N -> $REF @ $(git rev-parse --short "$HANDOFF"); work branch $BR @ $(git rev-parse --short HEAD) (clean base=$BASE)"
+      echo "Next: run a -m3k part2 against #$N (reads refs/archon-run/issue-$N-m3k)"

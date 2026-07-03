@@ -14,6 +14,8 @@ description: |
 worktree:
   enabled: false
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   - id: assist
     command: archon-assist

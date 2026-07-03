@@ -1,0 +1,348 @@
+name: archonx-fix-github-issue-part1-1o-2km3
+description: |
+  Use when: You want to FIX a GitHub issue but with the monolith split into 3
+  independently-runnable PARTS (plan -> implement -> review). This is PART 1 of 3:
+  classify + research + investigate/plan (opus) + adversarial negotiate (kimi
+  proposer -> M3 adversary). It FREEZES the plan and the acceptance contract onto a
+  deterministic shared branch and STOPS — part2 implements, part3 reviews.
+  Triggers: "fix issue part1 #123", "plan+contract for #123", "freeze contract #123".
+  NOT for: One-shot end-to-end fixes (use the monolith
+           archonx-fix-github-issue-1c-2km3-3kc-4m3m3), questions, PR reviews.
+
+  ── SPLIT DESIGN (memory project_split_fix_workflow, Spec A) ───────────────────
+  Archon has NO sub-workflow node (DAG node types: command/prompt/bash/loop/
+  approval/cancel/script only), so the 3 parts are SEPARATE `workflow run`
+  invocations linked by a DETERMINISTIC shared branch:  archon/fix-issue-<N>-opus.
+
+  Handoff is LOCAL-ONLY (no push between parts): all 3 parts must run in the SAME
+  git checkout. part1 creates the shared branch ref locally (it does NOT check it
+  out — so part2 can), commits the frozen artifacts onto it under
+  `.archon-run/issue-<N>/`, and stops.
+
+  HOW TO RUN THE CHAIN (same repo, sequentially):
+    1. archon workflow run archonx-fix-github-issue-part1-1o-2km3  <issue#>
+    2. archon workflow run archonx-fix-github-issue-part2-3ko       <issue#>
+    3. archon workflow run archonx-fix-github-issue-part3-4m3m3o    <issue#>
+
+  Frozen by this part (read by part2):
+    - .archon-run/issue-<N>/plan.md            (investigation or bridged plan)
+    - .archon-run/issue-<N>/contracts/impl.json (the acceptance contract — AUTHORITATIVE)
+    - .archon-run/issue-<N>/base-branch         (resolved PR base, so parts agree)
+
+  Model routing (this part):
+    - investigate / plan          -> claude/opus
+    - negotiate PROPOSER          -> pi/kimi-coding/kimi-for-coding
+    - negotiate ADVERSARY (merge) -> pi/minimax/MiniMax-M3
+    - everything else trivial     -> pi/MiniMax-M2.7
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If the message is ambiguous (e.g., "fix the SQLite timestamp bug"), use `gh issue list` to search for matching issues and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+
+  - id: fetch-issue
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      # Strip quotes, whitespace, markdown backticks from AI output
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number from: $extract-issue-number.output" >&2
+        exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+
+  # Derive the PR base branch from the issue's `target:` label.
+  #   no label / "target: main" -> main ;  "target: <x>" -> feat/<x>
+  - id: resolve-base-branch
+    depends_on: [extract-issue-number, fetch-issue]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      ISSUE_NUM=$(echo $extract-issue-number.output | grep -oE '[0-9]+' | head -1)
+      TARGET=$(gh issue view "$ISSUE_NUM" --json labels -q '[.labels[].name | select(startswith("target: "))][0] // ""' | sed 's/^target: //')
+      if [ -z "$TARGET" ] || [ "$TARGET" = "main" ]; then BR="main"; else BR="feat/$TARGET"; fi
+      if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: base '$BR' (target='${TARGET:-none}') not on origin" >&2; exit 1
+      fi
+      # Repoint the worktree onto the resolved base BEFORE any node reads or writes
+      # code, so investigation/planning see the correct tree. Guard refuses to repoint
+      # if uncommitted changes are present, in case the DAG is ever reordered.
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "resolve-base-branch: uncommitted changes present; refusing destructive repoint" >&2; exit 1
+      fi
+      if ! git fetch origin "$BR" --quiet; then
+        echo "resolve-base-branch: fetch origin/$BR failed" >&2; exit 1
+      fi
+      if ! git reset --hard "origin/$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: reset to origin/$BR failed" >&2; exit 1
+      fi
+      echo "resolve-base-branch -> $BR (worktree repointed)" >&2
+      printf '%s' "$BR"
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below and determine its type.
+
+      ## Issue Content
+
+      $fetch-issue.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | "add", "new", "support", "would be nice", net-new capability |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-issue]
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: INVESTIGATE (bugs) / PLAN (features) — claude/opus
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    provider: claude
+    model: opus
+    command: archon-investigate-issue
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: plan
+    provider: claude
+    model: opus
+    command: archon-create-plan
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  # Bridge: ensure investigation.md exists (plan path writes plan.md).
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — negotiate may fail"
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: NEGOTIATE (two-seat, cross-model)
+  #   PROPOSER  glm  -> drafts contract
+  #   ADVERSARY m3   -> audits + emits FINAL merged contract
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: negotiate-propose
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    prompt: |
+      You are the PROPOSER. Draft the acceptance CONTRACT for fixing this GitHub
+      issue. The contract is what an adversarial evaluator will later score the
+      implementation against, so it must be concrete, testable, and faithful to the
+      issue — NOT to whatever the implementer happens to build.
+
+      ## GitHub Issue
+
+      $fetch-issue.output
+
+      ## Classification
+
+      $classify.output
+
+      ## Investigation / Plan
+
+      Read `$ARTIFACTS_DIR/investigation.md` (it exists — it is either the bug
+      investigation or the bridged feature plan). Treat the issue body as the
+      AUTHORITATIVE spec; the investigation is the proposed approach.
+
+      ## Your task
+      Extract EVERY requirement the issue states: positive requirements (what must
+      happen), constraints (what must NOT happen / must stay unchanged), and edge
+      cases — each as its own first-class criterion. Propose 5-15. Each must be
+      concrete and verifiable (a command to run / output to inspect / file to read),
+      never "works correctly". You MAY read repo files to ground your `verify` steps.
+
+      Write `$ARTIFACTS_DIR/contracts/proposed.json` with the Write tool:
+      ```json
+      { "issue": "<number>",
+        "criteria": [ { "name": "kebab", "description": "...", "verify": "...", "threshold": 7 } ] }
+      ```
+      Return the same JSON as structured output.
+    depends_on: [bridge-artifacts]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+
+  - id: negotiate-adversary-merge
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [negotiate-propose]
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      You are the CRITERIA ADVERSARY — a DIFFERENT mind than the proposer. Find what
+      the proposed contract MISSES, then emit the FINAL merged contract. A shallow,
+      incomplete contract is how a PR silently drops part of the spec — close every hole.
+
+      Read:
+      - `$ARTIFACTS_DIR/issue.md` if present, otherwise treat the issue below as the
+        AUTHORITATIVE spec:
+
+        $fetch-issue.output
+
+      - `$ARTIFACTS_DIR/investigation.md` — the proposed approach (NOT authoritative).
+      - `$ARTIFACTS_DIR/contracts/proposed.json` — the proposer's draft (your target).
+      You MAY read repo files to ground checks.
+
+      ## Audit the draft against the issue (do ALL):
+      1. MISSING DELIVERABLES — every deliverable / constraint / "How to test" bullet
+         in the issue with NO matching criterion. Add one for each. Do not collapse
+         several into one.
+      2. WHOLE-SCOPE COVERAGE — for anything that must hold across MULTIPLE files (a
+         renamed/removed constant, a hardcoded value, a port), the `verify` must check
+         the ENTIRE affected directory, not just the headline file: require the new
+         token present AND the old/forbidden token absent
+         (e.g. `! git grep -n 'ttymxc4' -- bridge/ && git grep -q 'ttymxc0' -- bridge/`).
+      3. ANTI-THEATER — a criterion is satisfied only by CODE or observable behavior,
+         NEVER by a comment/docstring/PR text claiming it. Where a behavior is required,
+         `verify` must locate the actual call in source
+         (e.g. `git grep -n 'chmod' -- bridge/tty_bridge.py`), not a sentence.
+      4. HAPPY-PATH HOLES — reject any criterion a shallow one-file edit could pass
+         while leaving the rest of the scope stale; tighten it.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Add ONLY criteria grounded in the issue text. Do not invent requirements the
+      issue never states — that causes false rejections downstream.
+
+      ## Output
+      Write the FINAL merged contract to `$ARTIFACTS_DIR/contracts/impl.json` (union of
+      upheld proposed criteria + your additions, deduplicated, tightened):
+      ```json
+      {
+        "issue": "<number>",
+        "criteria": [
+          { "name": "short-kebab-name",
+            "description": "Specific, testable statement of what must be true",
+            "verify": "How an evaluator would check it (command to run, output to inspect, file to read)",
+            "threshold": 7 }
+        ]
+      }
+      ```
+      Also write `$ARTIFACTS_DIR/contracts/audit-notes.md` (what you UPHELD/TIGHTENED/
+      DROPPED and every criterion you ADDED, with why). Return the final contract JSON
+      as structured output.
+    output_format:
+      type: object
+      properties:
+        issue:
+          type: string
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              name:        { type: string }
+              description: { type: string }
+              verify:      { type: string }
+              threshold:   { type: number }
+            required: [name, description, verify, threshold]
+      required: [issue, criteria]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: FREEZE — store plan + contract under a SIDE REF and STOP
+  #   The handoff is stored in an ORPHAN commit under refs/archon-run/issue-<N>-opus,
+  #   NOT committed onto the work branch — otherwise the freeze commit lands in
+  #   the branch ancestry and the .archon-run/ artifacts leak into part2's PR
+  #   diff (observed on #71/PR #102). The work branch archon/fix-issue-<N>-opus is set
+  #   to the CLEAN base tip (no commits) and is NOT checked out, so part2 can
+  #   claim it and implement on top of a pristine base. Local-only: nothing pushed.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: freeze
+    depends_on: [negotiate-adversary-merge, resolve-base-branch]
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$N" ]; then echo "freeze: could not resolve issue number" >&2; exit 1; fi
+      BASE=$(printf '%s' "$resolve-base-branch.output" | tr -d ' \n')
+      [ -n "$BASE" ] || BASE=main
+      BR="archon/fix-issue-$N-opus"
+      REF="refs/archon-run/issue-$N-opus"
+
+      [ -f "$ARTIFACTS_DIR/contracts/impl.json" ] || { echo "freeze: contracts/impl.json missing — negotiate failed" >&2; exit 1; }
+      [ -f "$ARTIFACTS_DIR/investigation.md" ]     || { echo "freeze: investigation.md missing" >&2; exit 1; }
+
+      git config user.email  >/dev/null 2>&1 || git config user.email "archon@local"
+      git config user.name   >/dev/null 2>&1 || git config user.name  "Archon"
+
+      # Stage the handoff files into a TEMP index (never touches the work tree/branch),
+      # then build an orphan (parentless) commit and stash it under the side ref.
+      STAGE=$(mktemp -d)
+      printf '%s' "$BASE" > "$STAGE/base-branch"
+      add_blob() {  # $1 = src file on disk, $2 = path inside the handoff tree
+        [ -f "$1" ] || return 0
+        local blob; blob=$(git hash-object -w "$1")
+        git update-index --add --cacheinfo "100644,$blob,$2"
+      }
+      export GIT_INDEX_FILE="$STAGE/index"
+      git read-tree --empty
+      add_blob "$ARTIFACTS_DIR/investigation.md"          ".archon-run/issue-$N/plan.md"
+      add_blob "$ARTIFACTS_DIR/contracts/impl.json"       ".archon-run/issue-$N/contracts/impl.json"
+      add_blob "$ARTIFACTS_DIR/contracts/audit-notes.md"  ".archon-run/issue-$N/contracts/audit-notes.md"
+      add_blob "$STAGE/base-branch"                       ".archon-run/issue-$N/base-branch"
+      TREE=$(git write-tree)
+      HANDOFF=$(git commit-tree "$TREE" -m "archon handoff for #$N [part1]")
+      unset GIT_INDEX_FILE
+      git update-ref "$REF" "$HANDOFF"
+
+      # Work branch = CLEAN base tip (HEAD is origin/$BASE after resolve-base-branch),
+      # created WITHOUT checking it out so part2 can claim it.
+      git branch -f "$BR" HEAD
+      echo "part1 froze handoff for #$N -> $REF @ $(git rev-parse --short "$HANDOFF"); work branch $BR @ $(git rev-parse --short HEAD) (clean base=$BASE)"
+      echo "Next: archon workflow run archonx-fix-github-issue-part2-3ko $N"

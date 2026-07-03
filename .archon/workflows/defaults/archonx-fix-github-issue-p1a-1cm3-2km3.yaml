@@ -559,6 +559,15 @@ nodes:
       implementation against, so it must be concrete, testable, and faithful to the
       issue — NOT to whatever the implementer happens to build.
 
+      ### Capture the problem — never soften it to make it easy
+      Extract the issue's requirements at full strength. Do NOT drop, weaken, or
+      water down a requirement, constraint, or edge case just because it looks hard
+      to satisfy or verify — that pre-weakens the contract so a shallow fix can pass
+      downstream. If a requirement seems impossible or contradictory, still encode it
+      and flag the conflict in the criterion description; do not silently omit it. A
+      separate adversary audits this contract for MISSING requirements and will push
+      back, so under-specifying does not get us closer to done.
+
       ## GitHub Issue
 
       $fetch-issue.output

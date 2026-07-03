@@ -1,0 +1,83 @@
+name: archonx-ground-contract-negtest
+description: |
+  NEGATIVE / red-path test for the r-family ground-contract gate (design B). Seeds a
+  DELIBERATELY fabricated anchored contract (one anchor whose `expected` contradicts the
+  real fixture, one honest anchor), runs the REAL ground-contract node, then a
+  `freeze-marker` that depends on it. Expected: ground-contract FAILS (exit 1, writes
+  defects.md), and freeze-marker is SKIPPED (proving an exit-1 gate blocks the downstream
+  freeze in a live DAG). Run from the labeltool repo. NOT a real fix workflow.
+  Triggers: "ground-contract negtest".
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # Seed a fabricated contract: anchor A asserts a value the real fixture contradicts
+  # (gate byte at 0x0542 is 0x00, but we claim "1"); anchor B is honest (0x0540 == 1).
+  - id: seed-bad-contract
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/contracts"
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      ART="$ARTIFACTS_DIR" "$PY" - << 'PYEOF'
+      import json, os
+      cfg = "tests/data/round_02/APP_Proprietes.cfg"
+      def loc(off): return f"python -c \"b=open('{cfg}','rb').read(); print(b[{hex(off)}])\""
+      c = {"issue": "65", "criteria": [
+        {"name": "deliberately-wrong-gate", "description": "FABRICATED: claims gate slot 2 = 1",
+         "verify": "true", "threshold": 7,
+         "ground": {"locator": loc(0x0542), "expected": "1"}},   # real byte is 0 -> MUST fail
+        {"name": "honest-anchor", "description": "real: gate slot 0 = 1",
+         "verify": "true", "threshold": 7,
+         "ground": {"locator": loc(0x0540), "expected": "1"}},   # real byte is 1 -> passes
+      ]}
+      json.dump(c, open(os.path.join(os.environ["ART"], "contracts", "impl.json"), "w"), indent=2)
+      print("seeded fabricated contract (1 wrong anchor, 1 honest)")
+      PYEOF
+
+  # The REAL ground-contract node body (identical to r1-1cm3-2km3).
+  - id: ground-contract
+    depends_on: [seed-bad-contract]
+    timeout: 120000
+    bash: |
+      set -uo pipefail
+      C="$ARTIFACTS_DIR/contracts/impl.json"
+      [ -f "$C" ] || { echo "ground-contract: $C missing" >&2; exit 1; }
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      ART="$ARTIFACTS_DIR" GATE_BASH="$(command -v bash)" "$PY" - "$C" << 'PYEOF'
+      import json, subprocess, sys, os
+      d = json.load(open(sys.argv[1], encoding="utf-8"))
+      crit = d.get("criteria", [])
+      anchored = [c for c in crit if isinstance(c.get("ground"), dict)
+                  and c["ground"].get("locator") and "expected" in c["ground"]]
+      print(f"ground-contract: {len(crit)} criteria, {len(anchored)} anchored")
+      fails = []
+      for c in anchored:
+          loc = c["ground"]["locator"]; exp = str(c["ground"]["expected"]).strip()
+          r = subprocess.run([os.environ.get("GATE_BASH") or "bash", "-c", loc], capture_output=True, text=True)
+          act = (r.stdout or "").strip()
+          ok = (act == exp) and r.returncode == 0
+          print(f"  [{'PASS' if ok else 'FAIL'}] {c['name']}: expected {exp!r} actual {act!r}"
+                + (f" rc={r.returncode}" if r.returncode else ""))
+          if not ok:
+              fails.append((c["name"], exp, act))
+      if fails:
+          dfile = os.path.join(os.environ["ART"], "contracts", "defects.md")
+          with open(dfile, "w", encoding="utf-8") as f:
+              f.write("# CONTRACT DEFECTS — ground-contract gate (design B)\n\n")
+              for n, e, a in fails:
+                  f.write(f"- **{n}**: contract says `{e}`, real artifact yields `{a}`\n")
+          print(f"\nGROUND-CONTRACT FAILED: {len(fails)} fabricated value(s) — see {dfile}", file=sys.stderr)
+          sys.exit(1)
+      print("GROUND-CONTRACT PASSED: all anchored values match reality.")
+      PYEOF
+
+  # Stand-in for freeze: must NOT run if the gate blocks. If this writes the sentinel,
+  # the gate FAILED to block (test failure).
+  - id: freeze-marker
+    depends_on: [ground-contract]
+    timeout: 30000
+    bash: |
+      echo "FROZE — gate did NOT block (TEST FAILED)"
+      touch "$ARTIFACTS_DIR/.froze"

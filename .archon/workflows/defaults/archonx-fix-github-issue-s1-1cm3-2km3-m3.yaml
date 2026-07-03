@@ -1,0 +1,1061 @@
+name: archonx-fix-github-issue-s1-1cm3-2km3-m3
+description: |
+  Use when: You want to FIX a GitHub issue but with the monolith split into 3
+  independently-runnable PARTS (plan -> implement -> review). This is PART 1 of 3:
+  classify + research + investigate/plan (CODEX gpt-5.4) + a bounded adversarial AUDIT
+  of that plan/investigation (M3 adversary) + adversarial negotiate (kimi proposer ->
+  M3 adversary). It FREEZES the plan and the acceptance contract onto a
+  deterministic shared branch and STOPS — p2 implements, p3 reviews.
+  Triggers: "fix issue r1 1cm3 #123", "codex+m3 grounded plan+contract for #123".
+  NOT for: One-shot end-to-end fixes (use the monolith), questions, PR reviews.
+
+  ── s-FAMILY = r-FAMILY + VERIFY-CONTRACT-WITH-SPEC (anti-omission coverage gate) ──
+  Superset of r1-1cm3-2km3. Has BOTH gates before freeze:
+    1. verify-contract-with-spec (anti-OMISSION): a MiniMax-M3 coverage adversary checks every
+       issue requirement maps to an enforcing criterion. Policy = BOUNDED AUTO-FIX: kimi
+       folds uncovered requirements into the contract (ONE round), the coverage mind re-checks, and the
+       gate HARD-FAILS only if gaps remain. Catches dropped constraints (e.g. #65's
+       "no-fork / single combiner" that the v30 contract omitted → an incomplete PR).
+    2. ground-contract (anti-FABRICATION, design B): executes each `ground` anchor against
+       the real artifact; blocks freeze on any value that contradicts reality.
+  Order: coverage runs FIRST so criteria it adds also get reality-checked by ground-contract.
+  p2/p3 consume it unchanged (still -kimi suffix → p2-3kc, p3-4m3m3k).
+
+  ── ARGUMENT GRAMMAR (parsed identically in p1/p2/p3) ─────────────────────────
+    <issue#> [suffix] [from:<ref>]
+    - suffix  (STANDARD): a variant tag carried across all parts so you can run
+      parallel attempts without clearing the old branch. Forms: a bare `v<N>`
+      (e.g. `v22`) or `sfx:<token>`. Appended to BOTH the work branch and the side
+      ref: archon/fix-issue-<N>-kimi-<suffix> / refs/archon-run/issue-<N>-kimi-<suffix>.
+      Empty suffix == the original deterministic names. Freeze suffix is `-kimi`, so
+      p2-3kc / p3-4m3m3k (same suffix) link to it.
+    - from:<ref> (ESCAPE HATCH, non-standard): explicit commit/branch; the work branch
+      starts FROM <ref> instead of the clean base tip.
+
+  ── WHAT'S DIFFERENT vs p1-1c-2km3 ────────────────────────────────────────────
+  "1cm3": the plan/investigation is produced by CODEX (gpt-5.4), then a DIFFERENT mind
+  (M3) adversarially audits it for missing requirements / dropped constraints / unhandled
+  edge cases / wrong assumptions / bad sequencing, codex revises, M3 re-checks, and
+  codex does a 2nd revise ONLY IF an unresolved HIGH finding remains (bounded: max 2
+  revise rounds). This hardens the plan BEFORE it becomes the contract — closing the
+  plan-phase-adversary gap (memory project_plan_adversary_idea). p1-1c-2km3 has NO
+  plan-phase adversary — that is the one functional difference.
+  "2km3": negotiate PROPOSER is kimi; adversary stays M3.
+
+  ── SPLIT DESIGN (memory project_split_fix_workflow, Spec A) ───────────────────
+  Archon has NO sub-workflow node, so the 3 parts are SEPARATE `workflow run`
+  invocations linked by a DETERMINISTIC shared branch:  archon/fix-issue-<N>-kimi.
+  Handoff is LOCAL-ONLY (no push between parts): all 3 parts must run in the SAME
+  git checkout. part1 creates the shared branch ref locally (does NOT check it out),
+  stores the frozen artifacts in an orphan commit under refs/archon-run/issue-<N>-kimi,
+  and stops.
+
+  NOTE: this p1 uses the -kimi suffix, so it requires -kimi variants of p2/p3
+  to consume it (p2-3kc / p3-4m3m3k). Pass the SAME suffix to all three.
+
+  Frozen by this part (read by p2):
+    - .archon-run/issue-<N>/plan.md            (investigation or bridged plan, hardened)
+    - .archon-run/issue-<N>/contracts/impl.json (the acceptance contract — AUTHORITATIVE)
+    - .archon-run/issue-<N>/base-branch         (resolved PR base, so parts agree)
+
+  Model routing (this part):
+    - investigate / plan + revisions -> codex/gpt-5.4
+    - plan/investigation ADVERSARY   -> pi/minimax/MiniMax-M3
+    - negotiate PROPOSER             -> pi/kimi-coding/kimi-for-coding
+    - negotiate ADVERSARY (merge)    -> pi/minimax/MiniMax-M3
+    - everything else trivial        -> pi/MiniMax-M2.7
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If the message is ambiguous (e.g., "fix the SQLite timestamp bug"), use `gh issue list` to search for matching issues and pick the best match.
+      - IGNORE any trailing variant tokens like `v2`, `sfx:foo`, or `from:<ref>` — they are NOT the issue number.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+
+  # ── DEP-GATE: refuse to plan an issue whose prerequisite PRs are not yet merged ──
+  # Reads a "Depends-on: #N, #M" line from the issue body (real GitHub issue numbers).
+  # Each dep must be CLOSED (our convention: the PR that closes it is merged into the
+  # base branch). Any open dep -> hard-fail BEFORE the expensive plan/negotiate nodes run.
+  # No Depends-on line -> gate passes (no-op), so undeclared issues are unaffected.
+  - id: dep-gate
+    depends_on: [extract-issue-number]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then echo "dep-gate: could not resolve issue number" >&2; exit 1; fi
+      BODY=$(gh issue view "$ISSUE_NUM" --json body -q '.body' 2>/dev/null || true)
+      DEPS=$(printf '%s' "$BODY" | grep -ioE 'depends-on:[^\r\n]*' | grep -oE '#[0-9]+' | tr -d '#' | sort -un)
+      if [ -z "$DEPS" ]; then echo "dep-gate: #$ISSUE_NUM declares no Depends-on -> passing"; exit 0; fi
+      BLOCKED=""
+      for d in $DEPS; do
+        st=$(gh issue view "$d" --json state -q '.state' 2>/dev/null || echo "MISSING")
+        echo "dep-gate: #$ISSUE_NUM dep #$d -> $st"
+        [ "$st" = "CLOSED" ] || BLOCKED="$BLOCKED #$d($st)"
+      done
+      if [ -n "$BLOCKED" ]; then
+        echo "dep-gate: BLOCKED — #$ISSUE_NUM needs these merged/closed first:$BLOCKED" >&2
+        echo "dep-gate: merge the prerequisite PR(s) into the base branch, then re-run." >&2
+        exit 1
+      fi
+      echo "dep-gate: all prerequisites for #$ISSUE_NUM are CLOSED/merged -> proceeding"
+
+  - id: fetch-issue
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      # Strip quotes, whitespace, markdown backticks from AI output
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number from: $extract-issue-number.output" >&2
+        exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number, dep-gate]
+
+  # Derive the PR base branch from the issue's `target:` label.
+  #   no label / "target: main" -> main ;  "target: <x>" -> feat/<x>
+  - id: resolve-base-branch
+    depends_on: [extract-issue-number, fetch-issue]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      ISSUE_NUM=$(echo $extract-issue-number.output | grep -oE '[0-9]+' | head -1)
+      TARGET=$(gh issue view "$ISSUE_NUM" --json labels -q '[.labels[].name | select(startswith("target: "))][0] // ""' | sed 's/^target: //')
+      if [ -z "$TARGET" ] || [ "$TARGET" = "main" ]; then BR="main"; else BR="feat/$TARGET"; fi
+      if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: base '$BR' (target='${TARGET:-none}') not on origin" >&2; exit 1
+      fi
+      # Repoint the worktree onto the resolved base BEFORE any node reads or writes
+      # code, so investigation/planning see the correct tree. Guard refuses to repoint
+      # if uncommitted changes are present, in case the DAG is ever reordered.
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "resolve-base-branch: uncommitted changes present; refusing destructive repoint" >&2; exit 1
+      fi
+      if ! git fetch origin "$BR" --quiet; then
+        echo "resolve-base-branch: fetch origin/$BR failed" >&2; exit 1
+      fi
+      if ! git reset --hard "origin/$BR" >/dev/null 2>&1; then
+        echo "resolve-base-branch: reset to origin/$BR failed" >&2; exit 1
+      fi
+      echo "resolve-base-branch -> $BR (worktree repointed)" >&2
+      printf '%s' "$BR"
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below and determine its type.
+
+      ## Issue Content
+
+      $fetch-issue.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | "add", "new", "support", "would be nice", net-new capability |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-issue]
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3a: INVESTIGATE branch (bugs) — kimi produce, M3 adversary, bounded 2 rounds
+  #   produces / hardens $ARTIFACTS_DIR/investigation.md
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    provider: codex
+    model: gpt-5.4
+    command: archon-investigate-issue
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: investigate-audit
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [investigate]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the INVESTIGATION ADVERSARY — a DIFFERENT mind than the investigator.
+      You audit the bug investigation BEFORE it becomes an acceptance contract and a
+      fix. A weak investigation is how a PR fixes the wrong thing or misses a case.
+
+      ## GitHub Issue (AUTHORITATIVE problem statement)
+
+      $fetch-issue.output
+
+      Read `$ARTIFACTS_DIR/investigation.md` and the GitHub issue above IN FULL — that
+      pairing is your PRIMARY evidence. Audit investigation-vs-issue first.
+
+      ## REPO-READ BUDGET (hard cap — you will time out otherwise)
+      You MAY open AT MOST 6 repo files, and ONLY to confirm a SPECIFIC suspected HIGH
+      finding (e.g. a diagnosed root-cause file:line you doubt). Do NOT survey the tree
+      or ground MED/LOW findings against the repo. Spend your time reasoning, not
+      exploring.
+
+      ## Audit the investigation (do ALL):
+      1. ROOT CAUSE — is the diagnosed cause actually proven against the code, or
+         asserted? Name the file:line that proves or disproves it. Flag guesses.
+      2. REPRODUCTION — is there a concrete, runnable repro? If absent or vague, flag.
+      3. SCOPE / COMPLETENESS — does the same defect exist in sibling code paths the
+         investigation ignored (other call sites, other modes/files)? Flag misses.
+      4. EDGE CASES & FAILURE MODES — boundary values, error paths, CRLF/encoding,
+         idempotency, retries, concurrency — implied by the issue but unaddressed.
+      5. WRONG/UNSTATED ASSUMPTIONS — anything the investigation assumes that the
+         code or issue contradicts.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Only raise findings grounded in the issue text or the actual repo. Do not invent
+      requirements the issue never implies.
+
+      ## Output
+      Write `$ARTIFACTS_DIR/investigate-audit.md`: a numbered findings list. For each
+      finding give SEVERITY (HIGH = would cause a wrong/incomplete fix; MED = real gap,
+      should fix; LOW = nit), the specific evidence (file:line / command+output), and
+      what the investigation must add or correct.
+      Then return structured output.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        high_count:
+          type: number
+        med_count:
+          type: number
+        summary:
+          type: string
+      required: [unresolved_high, high_count, med_count, summary]
+
+  - id: investigate-revise
+    provider: codex
+    model: gpt-5.4
+    depends_on: [investigate-audit]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the investigator, hardening your own analysis against an adversary.
+
+      The GitHub issue is the AUTHORITATIVE problem statement:
+
+      $fetch-issue.output
+
+      Read your current `$ARTIFACTS_DIR/investigation.md` and the adversary's findings
+      in `$ARTIFACTS_DIR/investigate-audit.md`.
+
+      Address EVERY HIGH and MED finding: prove the root cause against the code, add a
+      concrete repro, widen scope to the sibling paths/edge cases the adversary named.
+      Rewrite `$ARTIFACTS_DIR/investigation.md` in place with the corrected, more
+      complete analysis. If you deliberately REJECT a finding, keep it but add a
+      one-line justification grounded in the issue/code.
+
+      Append a `## Revision log (round 1)` section listing what you changed and what
+      you rejected and why.
+
+  - id: investigate-recheck
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [investigate-revise]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the INVESTIGATION ADVERSARY re-checking the revised analysis (round 2).
+
+      The GitHub issue (AUTHORITATIVE):
+
+      $fetch-issue.output
+
+      Read the revised `$ARTIFACTS_DIR/investigation.md` and your prior
+      `$ARTIFACTS_DIR/investigate-audit.md`. For each prior HIGH/MED finding decide
+      RESOLVED / PARTIAL / UNRESOLVED with evidence. Do not open new lines of attack
+      unless they are HIGH severity grounded in the issue.
+
+      Write `$ARTIFACTS_DIR/investigate-recheck.md` with the verdict per finding, then
+      return structured output. Set unresolved_high="true" ONLY if a HIGH finding
+      remains genuinely unaddressed.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        summary:
+          type: string
+      required: [unresolved_high, summary]
+
+  # 2nd revise — runs ONLY if a HIGH finding survived the re-check (bounded last round).
+  # The issue_type guard MUST come first: AND short-circuits, so on the feature branch
+  # (recheck skipped) the $investigate-recheck.output ref is never resolved → no
+  # OutputRefError. (condition-evaluator: compound AND, left-to-right short-circuit.)
+  - id: investigate-revise-2
+    provider: codex
+    model: gpt-5.4
+    depends_on: [investigate-recheck]
+    when: "$classify.output.issue_type == 'bug' && $investigate-recheck.output.unresolved_high == 'true'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      Final bounded revision. The adversary's re-check
+      (`$ARTIFACTS_DIR/investigate-recheck.md`) still reports an unresolved HIGH.
+      The GitHub issue (AUTHORITATIVE):
+
+      $fetch-issue.output
+
+      Read the re-check plus `$ARTIFACTS_DIR/investigation.md`. Resolve the remaining
+      HIGH finding(s) and rewrite `investigation.md` in place. Append a
+      `## Revision log (round 2)` section. This is the last revision round.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3b: PLAN branch (features/etc) — kimi produce, M3 adversary, bounded 2 rounds
+  #   produces / hardens $ARTIFACTS_DIR/plan.md
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: plan
+    provider: codex
+    model: gpt-5.4
+    command: archon-create-plan
+    depends_on: [classify, web-research, resolve-base-branch]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  - id: plan-audit
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [plan]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the PLAN ADVERSARY — a DIFFERENT mind than the planner. You audit the
+      implementation PLAN before it becomes an acceptance contract and code. A plan
+      with holes is how a PR silently drops part of the spec or builds the wrong thing.
+
+      ## GitHub Issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read `$ARTIFACTS_DIR/plan.md` and the GitHub issue above IN FULL — that pairing
+      is your PRIMARY evidence and needs zero repo access. Audit plan-vs-issue first.
+
+      ## REPO-READ BUDGET (hard cap — you will time out otherwise)
+      You MAY open AT MOST 6 repo files, and ONLY to confirm a SPECIFIC suspected HIGH
+      finding (e.g. a file:line the plan cites that you doubt). Do NOT read the plan's
+      "Mandatory Reading" list, do NOT survey the tree, do NOT ground MED/LOW findings
+      against the repo. A gap between the plan and the issue text is a finding on its
+      own and needs no file read. Spend your time reasoning, not exploring.
+
+      ## Audit the plan (do ALL):
+      1. MISSING REQUIREMENTS — every deliverable / constraint / "How to test" bullet
+         in the issue with NO corresponding step in the plan. Flag each.
+      2. CONSTRAINTS DROPPED — "must NOT change" / "stays unchanged" / invariants the
+         plan would violate or ignores.
+      3. EDGE CASES & FAILURE MODES — boundary values, error/retry paths, idempotency,
+         ordering, CRLF/encoding, concurrency — implied by the issue but unplanned.
+      4. WRONG ASSUMPTIONS — steps that assume something the code/issue contradicts.
+      5. AMBIGUITY — steps too vague to implement or verify deterministically.
+      6. SEQUENCING — steps in an order that cannot work (relies on output an earlier
+         step never produces).
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Only raise findings grounded in the issue text or the actual repo. Do not invent
+      requirements the issue never states.
+
+      ## Output
+      Write `$ARTIFACTS_DIR/plan-audit.md`: a numbered findings list. For each finding
+      give SEVERITY (HIGH = would cause a wrong/incomplete implementation; MED = real
+      gap, should fix; LOW = nit), specific evidence (issue bullet / file:line), and
+      what the plan must add or correct.
+      Then return structured output.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        high_count:
+          type: number
+        med_count:
+          type: number
+        summary:
+          type: string
+      required: [unresolved_high, high_count, med_count, summary]
+
+  - id: plan-revise
+    provider: codex
+    model: gpt-5.4
+    depends_on: [plan-audit]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the planner, hardening your own plan against an adversary.
+
+      ## GitHub Issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read your current `$ARTIFACTS_DIR/plan.md` and the adversary's findings in
+      `$ARTIFACTS_DIR/plan-audit.md`.
+
+      Address EVERY HIGH and MED finding: add the missing steps, restore dropped
+      constraints, plan the edge cases, fix sequencing, disambiguate. Rewrite
+      `$ARTIFACTS_DIR/plan.md` in place with the corrected, more complete plan. If you
+      deliberately REJECT a finding, keep it but add a one-line justification grounded
+      in the issue/code.
+
+      Append a `## Revision log (round 1)` section listing what you changed and what
+      you rejected and why.
+
+  - id: plan-recheck
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [plan-revise]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the PLAN ADVERSARY re-checking the revised plan (round 2).
+
+      ## GitHub Issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read the revised `$ARTIFACTS_DIR/plan.md` and your prior
+      `$ARTIFACTS_DIR/plan-audit.md`. For each prior HIGH/MED finding decide RESOLVED /
+      PARTIAL / UNRESOLVED with evidence. Do not open new lines of attack unless they
+      are HIGH severity grounded in the issue.
+
+      Write `$ARTIFACTS_DIR/plan-recheck.md` with the verdict per finding, then return
+      structured output. Set unresolved_high="true" ONLY if a HIGH finding remains
+      genuinely unaddressed.
+    output_format:
+      type: object
+      properties:
+        unresolved_high:
+          type: string
+          enum: ["true", "false"]
+        summary:
+          type: string
+      required: [unresolved_high, summary]
+
+  # 2nd revise — runs ONLY if a HIGH finding survived the re-check (bounded last round).
+  # issue_type guard first (AND short-circuit) so the bug branch never resolves
+  # $plan-recheck.output (skipped) → no OutputRefError.
+  - id: plan-revise-2
+    provider: codex
+    model: gpt-5.4
+    depends_on: [plan-recheck]
+    when: "$classify.output.issue_type != 'bug' && $plan-recheck.output.unresolved_high == 'true'"
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      Final bounded revision. The adversary's re-check
+      (`$ARTIFACTS_DIR/plan-recheck.md`) still reports an unresolved HIGH.
+      The GitHub issue (AUTHORITATIVE spec):
+
+      $fetch-issue.output
+
+      Read the re-check plus `$ARTIFACTS_DIR/plan.md`. Resolve the remaining HIGH
+      finding(s) and rewrite `plan.md` in place. Append a `## Revision log (round 2)`
+      section. This is the last revision round.
+
+  # Bridge: ensure investigation.md exists (plan path writes plan.md).
+  #   Depends on the always-run tail of BOTH branches (recheck) plus the conditional
+  #   2nd-revise nodes, so it runs after the WHOLE active branch settles regardless of
+  #   whether revise-2 fired (layered execution guarantees bridge is in a later layer).
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — negotiate may fail"
+      fi
+    depends_on: [investigate-recheck, investigate-revise-2, plan-recheck, plan-revise-2]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: NEGOTIATE (two-seat, cross-model)
+  #   PROPOSER  kimi -> drafts contract
+  #   ADVERSARY m3   -> audits + emits FINAL merged contract
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: negotiate-propose
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    prompt: |
+      You are the PROPOSER. Draft the acceptance CONTRACT for fixing this GitHub
+      issue. The contract is what an adversarial evaluator will later score the
+      implementation against, so it must be concrete, testable, and faithful to the
+      issue — NOT to whatever the implementer happens to build.
+
+      ## GitHub Issue
+
+      $fetch-issue.output
+
+      ## Classification
+
+      $classify.output
+
+      ## Investigation / Plan
+
+      Read `$ARTIFACTS_DIR/investigation.md` (it exists — it is either the hardened bug
+      investigation or the bridged hardened feature plan). Treat the issue body as the
+      AUTHORITATIVE spec; the investigation is the proposed approach.
+
+      ## Your task
+      Extract EVERY requirement the issue states: positive requirements (what must
+      happen), constraints (what must NOT happen / must stay unchanged), and edge
+      cases — each as its own first-class criterion. Propose 5-15. Each must be
+      concrete and verifiable (a command to run / output to inspect / file to read),
+      never "works correctly". You MAY read repo files to ground your `verify` steps.
+
+      Write `$ARTIFACTS_DIR/contracts/proposed.json` with the Write tool:
+      ```json
+      { "issue": "<number>",
+        "criteria": [ { "name": "kebab", "description": "...", "verify": "...", "threshold": 7 } ] }
+      ```
+      Return the same JSON as structured output.
+    depends_on: [bridge-artifacts]
+    context: fresh
+    allowed_tools: [Read, Write, Grep, Bash]
+
+  # CRITIC (M3) — emits a SMALL findings DELTA only. Emitting the full contract here is
+  # what times out M3 (large single-shot generation), so this node is bounded to a terse
+  # delta; the kimi applier below renders the final impl.json from it.
+  - id: negotiate-audit
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [negotiate-propose]
+    context: fresh
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the CRITERIA ADVERSARY — a DIFFERENT mind than the proposer. Find what the
+      proposed contract MISSES. You do NOT rewrite the contract — you emit a SMALL delta
+      that a separate applier folds in. Keeping your output small is REQUIRED: emitting a
+      full contract here causes a timeout.
+
+      Read:
+      - the issue below as the AUTHORITATIVE spec:
+
+        $fetch-issue.output
+
+      - `$ARTIFACTS_DIR/investigation.md` — the proposed approach (NOT authoritative).
+      - `$ARTIFACTS_DIR/contracts/proposed.json` — the proposer's draft (your target).
+
+      ## REPO-READ BUDGET (hard cap — you will time out otherwise)
+      Your job is issue-vs-contract completeness, which needs no repo access. You MAY
+      open AT MOST 6 repo files, and ONLY to confirm a path/token for a verify hint.
+      Do NOT survey the tree.
+
+      ## Audit the draft against the issue (do ALL):
+      1. MISSING DELIVERABLES — every deliverable / constraint / "How to test" bullet in
+         the issue with NO matching criterion. One delta each; do not collapse.
+      2. WHOLE-SCOPE COVERAGE — anything that must hold across MULTIPLE files needs a
+         verify that checks the ENTIRE affected dir (new token present AND old absent,
+         e.g. `! git grep -n 'ttymxc4' -- bridge/ && git grep -q 'ttymxc0' -- bridge/`).
+      3. ANTI-THEATER — satisfied only by CODE/observable behavior, never a comment or
+         PR claim (verify must locate the real call, e.g. `git grep -n 'chmod' -- bridge/`).
+      4. HAPPY-PATH HOLES — a shallow one-file edit must not be able to pass it.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Raise ONLY items grounded in the issue text — inventing requirements causes false
+      rejections downstream.
+
+      ## Output — SMALL DELTA ONLY (do NOT write a full contract)
+      Write `$ARTIFACTS_DIR/contracts/audit-notes.md` as a terse list. For each item give
+      ACTION (ADD | TIGHTEN | DROP), the criterion `name` (kebab), a ONE-LINE reason, and
+      a verify HINT (a command fragment, not a polished criterion). For TIGHTEN, name the
+      existing criterion and what to add. Aim for <= 12 items. Then return the same delta
+      as structured output.
+    output_format:
+      type: object
+      properties:
+        deltas:
+          type: array
+          items:
+            type: object
+            properties:
+              action:      { type: string, enum: ["ADD", "TIGHTEN", "DROP"] }
+              name:        { type: string }
+              reason:      { type: string }
+              verify_hint: { type: string }
+            required: [action, name, reason]
+      required: [deltas]
+
+  # APPLIER (kimi) — renders the FINAL impl.json from proposed.json + the M3 delta.
+  # kimi handles large structured output fine (it wrote the plan); this is the big-output
+  # seat M3 cannot hold. The adversarial value lives in negotiate-audit above.
+  - id: negotiate-apply
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [negotiate-audit]
+    context: fresh
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You are the PROPOSER integrating an adversary's findings into the FINAL contract.
+      This is mechanical rendering, NOT a re-audit: apply every delta faithfully.
+
+      Read:
+      - `$ARTIFACTS_DIR/contracts/proposed.json` — your draft contract.
+      - `$ARTIFACTS_DIR/contracts/audit-notes.md` — the adversary's delta (ADD / TIGHTEN
+        / DROP items with verify hints).
+      - the issue as the AUTHORITATIVE spec:
+
+        $fetch-issue.output
+
+      Apply EVERY delta: ADD new criteria, TIGHTEN named ones (make `verify` check the
+      whole scope / locate the real call in source, never a comment or PR claim), and
+      DROP only those marked DROP. You MAY read repo files to make a `verify` command
+      concrete. Each criterion must be concrete and verifiable, never "works correctly".
+
+      Write the FINAL merged contract to `$ARTIFACTS_DIR/contracts/impl.json`:
+      ```json
+      {
+        "issue": "<number>",
+        "criteria": [
+          { "name": "short-kebab-name",
+            "description": "Specific, testable statement of what must be true",
+            "verify": "Command to run / output to inspect / file to read",
+            "threshold": 7,
+            "ground": { "locator": "shell one-liner printing the ACTUAL raw value", "expected": "exact stdout it must print" } }
+        ]
+      }
+      ```
+
+      ## GROUND ANCHORS (anti-fabrication — REQUIRED for every concrete-value criterion)
+      A downstream `ground-contract` gate will EXECUTE these against the real repo at the
+      base commit and BLOCK the freeze if any `expected` does not match reality. This
+      catches invented offsets / byte values / counts before they poison the contract.
+      For EVERY criterion that asserts a CONCRETE literal — an exact byte/offset value, a
+      fixed count, a specific decoded value from a fixture/data file — add a `ground`
+      object:
+      - `locator`: a single shell command that reads the RAW artifact (the fixture/data
+        FILE bytes, a config value, etc.) and prints ONLY the actual value. It MUST read
+        the underlying artifact directly (e.g. `python -c "b=open('tests/data/x.cfg','rb').read(); print(list(b[0x052C:0x0531]))"`),
+        and MUST NOT call the code-under-test — so it reflects reality, not the (future)
+        implementation. Paths are relative to the repo root. Use `python` — NOT `python3`,
+        which does not exist in the gate's shell and would make the gate false-block a
+        correct contract.
+      - `expected`: the EXACT trimmed stdout the locator must print, copied from what you
+        asserted in the description. If you cannot produce a locator that already prints
+        `expected` from the real artifact, your asserted value is WRONG — fix it by
+        reading the artifact yourself NOW (you have Bash) before writing the contract.
+      Criteria about behavior that does not exist yet (no raw artifact to read) OMIT
+      `ground` — the gate skips them. Do NOT invent a locator that calls unwritten code.
+
+      ## STRICT JSON - the contract MUST parse (json.load reads it downstream)
+      A backslash is the #1 cause of an invalid contract. In `verify` (and any) strings:
+      - Do NOT emit raw regex backslash escapes like `\s` `\d` `\+` `\.` - those are
+        invalid JSON and corrupt the file. Prefer a regex WITHOUT them: POSIX classes
+        (`[[:space:]]`, `[0-9]`), literal spaces, or `grep -F` for fixed strings.
+      - If a backslash is truly unavoidable, JSON-escape it (write `\s` so it parses).
+      - Keep each `verify` single-line and shell-safe; use single quotes inside the command.
+      Then VALIDATE before finishing - run this and FIX until it prints OK:
+      ```bash
+      python -c "import json; json.load(open('$ARTIFACTS_DIR/contracts/impl.json')); print('contract OK')" \
+        || echo 'IMPL.JSON INVALID - fix the escapes and rewrite it'
+      ```
+      Do NOT finish while that command reports an error.
+
+      Return the same JSON as structured output.
+    output_format:
+      type: object
+      properties:
+        issue:
+          type: string
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              name:        { type: string }
+              description: { type: string }
+              verify:      { type: string }
+              threshold:   { type: number }
+              ground:
+                type: object
+                properties:
+                  locator:  { type: string }
+                  expected: { type: string }
+            required: [name, description, verify, threshold]
+      required: [issue, criteria]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4a2: VERIFY-CONTRACT-WITH-SPEC (s-family — anti-omission, coverage)
+  #   A coverage adversary (DIFFERENT mind — MiniMax-M3) checks every issue requirement maps to
+  #   an enforcing criterion. Policy: BOUNDED AUTO-FIX — kimi folds the uncovered
+  #   requirements into the contract (one round), the coverage mind re-checks, and the gate HARD-FAILS
+  #   only if requirements remain uncovered after that round. Catches OMISSION (e.g. #65's
+  #   "no-fork / single combiner" constraint that the v30 contract dropped). Runs BEFORE
+  #   ground-contract so any criteria it ADDS still get reality-checked.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: coverage-audit
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [negotiate-apply]
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Grep, Bash]
+    prompt: |
+      You are the SPEC-COVERAGE ADVERSARY — a DIFFERENT mind than the contract's authors.
+      Your ONLY job: verify the acceptance contract covers EVERY requirement the GitHub
+      issue states. A DROPPED requirement is how a PR passes its own contract yet fails the
+      issue (e.g. a "do not fork / ONE shared module" constraint that no criterion enforces,
+      so a duplicate stays alive).
+
+      ## GitHub issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read `$ARTIFACTS_DIR/contracts/impl.json` — the contract.
+
+      ## Method (do ALL)
+      1. Enumerate EVERY requirement the issue states as discrete items: each Deliverable
+         bullet, each "How to test" item, each Constraint, each MUST / MUST-NOT / "do not".
+      2. For each, find the criterion/criteria that ENFORCE it. A requirement is COVERED
+         only if some criterion's `verify` would FAIL an implementation that violated it
+         (e.g. a "no duplicate combiner outside the shared module" requirement needs a
+         verify that greps the OTHER files and fails if the logic is still there).
+      2b. NEGATIVE constraints — "must NOT", "no-fork", "do not duplicate", "X must not
+         exist outside Y", "stays unchanged" — are COVERED ONLY by a NEGATIVE assertion: a
+         verify that greps for the forbidden thing's ABSENCE (e.g.
+         `test $(git grep -nE '<forbidden token>' -- <other files> | grep -v <shared module>
+         | wc -l) -eq 0`). A POSITIVE / behavioral criterion (e.g. "the consumer CALLS the
+         shared helper", "delegation happens") does NOT cover a negative constraint: an impl
+         can pass the positive check while a leftover or dead duplicate still exists. If the
+         only enforcing criterion for a must-not requirement is positive, flag it UNCOVERED
+         and suggest the negative grep.
+      3. Flag every requirement with NO enforcing criterion as UNCOVERED.
+
+      ## GUARDRAIL (no gold-plating)
+      Flag ONLY requirements the issue EXPLICITLY states; quote the issue text for each.
+      Do NOT invent requirements.
+
+      Write `$ARTIFACTS_DIR/contracts/coverage-audit.md` — a numbered UNCOVERED list, each
+      with the issue quote, a suggested criterion `name`, and what its `verify` must assert.
+      Then return structured output.
+    output_format:
+      type: object
+      properties:
+        all_covered: { type: string, enum: ["true", "false"] }
+        uncovered:
+          type: array
+          items:
+            type: object
+            properties:
+              requirement:    { type: string }
+              issue_evidence: { type: string }
+              suggested_name: { type: string }
+              verify_hint:    { type: string }
+            required: [requirement]
+      required: [all_covered]
+
+  # APPLIER (kimi) — bounded ONE round. Folds the uncovered requirements into impl.json as
+  # new enforcing criteria (preserving all existing). No-op rewrite if nothing uncovered.
+  - id: coverage-apply
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [coverage-audit]
+    context: fresh
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You integrate any MISSING-requirement findings into the contract. BOUNDED: one round.
+
+      Read:
+      - `$ARTIFACTS_DIR/contracts/impl.json` — the current contract.
+      - `$ARTIFACTS_DIR/contracts/coverage-audit.md` — uncovered requirements (may be empty).
+      - the issue (AUTHORITATIVE):
+
+        $fetch-issue.output
+
+      If the audit lists NO uncovered requirements, rewrite impl.json UNCHANGED — preserve
+      every existing criterion VERBATIM — and finish.
+      Otherwise ADD exactly one criterion per uncovered requirement: a concrete
+      `description`; a `verify` that FAILS a violating implementation and checks the WHOLE
+      scope (e.g. `! git grep -nE '<the duplicated logic>' -- <other files>` to prove a
+      combiner does NOT live outside the shared module); `threshold` 7; and — for any
+      concrete value claim — a `ground` anchor {locator, expected} reading the RAW artifact
+      (use `python`, NOT python3). PRESERVE all existing criteria; only ADD. Do not invent
+      requirements beyond the audit.
+
+      ## STRICT JSON - the contract MUST parse (json.load reads it downstream)
+      Do NOT emit raw regex backslash escapes (`\s` `\d` `\+`) — use POSIX classes
+      (`[[:space:]]`, `[0-9]`), literal spaces, or `grep -F`. Keep each `verify` single-line.
+      Validate before finishing and FIX until it prints OK:
+      ```bash
+      python -c "import json; json.load(open('$ARTIFACTS_DIR/contracts/impl.json')); print('contract OK')" \
+        || echo 'IMPL.JSON INVALID - fix the escapes and rewrite it'
+      ```
+      Write the merged contract to `$ARTIFACTS_DIR/contracts/impl.json`. Return it as
+      structured output.
+    output_format:
+      type: object
+      properties:
+        issue: { type: string }
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              name:        { type: string }
+              description: { type: string }
+              verify:      { type: string }
+              threshold:   { type: number }
+              ground:
+                type: object
+                properties:
+                  locator:  { type: string }
+                  expected: { type: string }
+            required: [name, description, verify, threshold]
+      required: [issue, criteria]
+
+  # RECHECK (same coverage mind) — bounded final coverage verdict on the UPDATED contract. Writes a
+  # machine verdict file the gate reads (no fragile structured-output interpolation in bash).
+  - id: coverage-recheck
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [coverage-apply]
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      Re-audit coverage after the applier folded in fixes (bounded FINAL check).
+
+      ## GitHub issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read the UPDATED `$ARTIFACTS_DIR/contracts/impl.json`. For each requirement the issue
+      states, confirm an ENFORCING criterion now exists (one whose verify fails a violator).
+      Set all_covered = "false" ONLY if a genuine issue requirement still has no enforcing
+      criterion.
+
+      Write `$ARTIFACTS_DIR/contracts/coverage-recheck.md` (verdict per requirement), AND
+      write the machine verdict file `$ARTIFACTS_DIR/contracts/coverage-verdict.json` with
+      the Write tool, containing exactly:
+      {"all_covered": "true"}   (or "false")
+      Then return the same as structured output.
+    output_format:
+      type: object
+      properties:
+        all_covered:     { type: string, enum: ["true", "false"] }
+        still_uncovered: { type: array, items: { type: string } }
+        summary:         { type: string }
+      required: [all_covered]
+
+  # GATE (deterministic) — fail-closed. Reads the verdict file; HARD-FAILS (exit 1) if
+  # requirements remain uncovered after the bounded fix round, or if the verdict is missing.
+  - id: coverage-gate
+    depends_on: [coverage-recheck]
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      V="$ARTIFACTS_DIR/contracts/coverage-verdict.json"
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      if [ ! -f "$V" ]; then
+        echo "coverage-gate: verdict file missing — failing closed" >&2; exit 1
+      fi
+      "$PY" - "$V" << 'PYEOF'
+      import json, sys
+      try:
+          d = json.load(open(sys.argv[1], encoding="utf-8"))
+      except Exception as e:
+          print(f"coverage-gate: cannot parse verdict ({e}) — failing closed", file=sys.stderr); sys.exit(1)
+      ok = str(d.get("all_covered")).strip().lower() == "true"
+      print("coverage-gate:", "PASS — all issue requirements covered" if ok
+            else "FAIL — requirements still uncovered after bounded fix (see coverage-recheck.md)")
+      sys.exit(0 if ok else 1)
+      PYEOF
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4b: GROUND-CONTRACT GATE (design B — anti-fabrication)
+  #   Execute every criterion's `ground` anchor against the REAL artifact in the base
+  #   worktree. If any asserted value contradicts reality, BLOCK the freeze (exit 1) so a
+  #   fabricated offset/byte/count contract never freezes. Criteria without a `ground`
+  #   anchor are skipped. Runs AFTER coverage so added criteria are reality-checked too.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: ground-contract
+    depends_on: [coverage-gate]
+    timeout: 120000
+    bash: |
+      set -uo pipefail
+      C="$ARTIFACTS_DIR/contracts/impl.json"
+      [ -f "$C" ] || { echo "ground-contract: $C missing" >&2; exit 1; }
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      ART="$ARTIFACTS_DIR" GATE_BASH="$(command -v bash)" "$PY" - "$C" << 'PYEOF'
+      import json, subprocess, sys, os
+      d = json.load(open(sys.argv[1], encoding="utf-8"))
+      crit = d.get("criteria", [])
+      anchored = [c for c in crit if isinstance(c.get("ground"), dict)
+                  and c["ground"].get("locator") and "expected" in c["ground"]]
+      print(f"ground-contract: {len(crit)} criteria, {len(anchored)} anchored")
+      fails = []
+      deferred = []
+      for c in anchored:
+          loc = c["ground"]["locator"]; exp = str(c["ground"]["expected"]).strip()
+          # DEFER: branch-identity locators are only true on the work branch during p2,
+          # not in this freeze worktree (a task branch). Enforced post-impl by verify.
+          if ("rev-parse --abbrev-ref" in loc) or ("symbolic-ref" in loc):
+              deferred.append((c["name"], "branch-identity locator (enforced on the work branch during p2 verify)"))
+              print(f"  [DEFER] {c['name']}: branch-identity locator")
+              continue
+          r = subprocess.run([os.environ.get("GATE_BASH") or "bash", "-c", loc], capture_output=True, text=True)
+          act = (r.stdout or "").strip()
+          # DEFER: not groundable at freeze (errors or empty) -> references an artifact the
+          # implementation will create; each criterion verify enforces it in p2/p3.
+          if r.returncode != 0 or act == "":
+              deferred.append((c["name"], f"not groundable at freeze (rc={r.returncode}, empty_output={act==''}); references a not-yet-created artifact"))
+              print(f"  [DEFER] {c['name']}: not groundable yet (rc={r.returncode}, actual {act!r})")
+              continue
+          # Artifact exists now: a non-empty value contradicting expected is a real fabrication.
+          ok = (act == exp)
+          print(f"  [{'PASS' if ok else 'FAIL'}] {c['name']}: expected {exp!r} actual {act!r}")
+          if not ok:
+              fails.append((c["name"], exp, act))
+      if deferred:
+          nfile = os.path.join(os.environ["ART"], "contracts", "deferred.md")
+          with open(nfile, "w", encoding="utf-8") as f:
+              f.write("# GROUND-CONTRACT - DEFERRED criteria (not groundable at freeze)" + chr(10)*2)
+              f.write("These reference the work branch or artifacts the implementation will create, so they cannot be ground-checked at freeze. They are NOT fabrications; each criterion verify enforces them in p2/p3 after implementation." + chr(10)*2)
+              for n, why in deferred:
+                  f.write(f"- **{n}**: {why}" + chr(10))
+          print(f"ground-contract: {len(deferred)} criterion(s) DEFERRED (not groundable at freeze) -> {nfile}")
+      if fails:
+          dfile = os.path.join(os.environ["ART"], "contracts", "defects.md")
+          with open(dfile, "w", encoding="utf-8") as f:
+              f.write("# CONTRACT DEFECTS - ground-contract gate (design B)" + chr(10)*2)
+              f.write("These criteria assert values the REAL artifact (present at freeze) contradicts. The contract was NOT frozen. Fix the expected values (read the artifact) and re-run." + chr(10)*2)
+              for n, e, a in fails:
+                  f.write(f"- **{n}**: contract says `{e}`, real artifact yields `{a}`" + chr(10))
+          print(f"GROUND-CONTRACT FAILED: {len(fails)} fabricated value(s) -- see {dfile}", file=sys.stderr)
+          sys.exit(1)
+      checked = len(anchored) - len(deferred)
+      print(f"GROUND-CONTRACT PASSED: {checked} anchored value(s) match reality, {len(deferred)} deferred to p2/p3.")
+      PYEOF
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: FREEZE — store plan + contract under a SIDE REF and STOP
+  #   Identical mechanism to part1-1c-2gm3 but with the -kimi suffix. The handoff is
+  #   an ORPHAN commit under refs/archon-run/issue-<N>-kimi (NOT on the work branch,
+  #   so .archon-run/ cannot leak into part2's PR). The work branch
+  #   archon/fix-issue-<N>-kimi is set to the CLEAN base tip and NOT checked out, so a
+  #   -kimi part2 can claim it. Local-only: nothing pushed.
+  #   r-family: freeze is GATED behind ground-contract (won't run if the gate failed).
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: freeze
+    depends_on: [negotiate-apply, resolve-base-branch, ground-contract]
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$N" ]; then echo "freeze: could not resolve issue number" >&2; exit 1; fi
+      # --- variant args (parsed identically in p1/p2/p3) ---
+      SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'sfx:[A-Za-z0-9._-]+' | head -1 | sed 's/^sfx://')
+      [ -n "$SFX" ] || SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -owE 'v[0-9]+' | head -1)
+      FROM=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'from:[^[:space:]]+' | head -1 | sed 's/^from://')
+      BASE=$(printf '%s' "$resolve-base-branch.output" | tr -d ' \n')
+      [ -n "$BASE" ] || BASE=main
+      BR="archon/fix-issue-$N-kimi${SFX:+-$SFX}"
+      REF="refs/archon-run/issue-$N-kimi${SFX:+-$SFX}"
+
+      [ -f "$ARTIFACTS_DIR/contracts/impl.json" ] || { echo "freeze: contracts/impl.json missing — negotiate failed" >&2; exit 1; }
+      [ -f "$ARTIFACTS_DIR/investigation.md" ]     || { echo "freeze: investigation.md missing" >&2; exit 1; }
+
+      git config user.email  >/dev/null 2>&1 || git config user.email "archon@local"
+      git config user.name   >/dev/null 2>&1 || git config user.name  "Archon"
+
+      # Stage the handoff files into a TEMP index (never touches the work tree/branch),
+      # then build an orphan (parentless) commit and stash it under the side ref.
+      STAGE=$(mktemp -d)
+      printf '%s' "$BASE" > "$STAGE/base-branch"
+      add_blob() {  # $1 = src file on disk, $2 = path inside the handoff tree
+        [ -f "$1" ] || return 0
+        local blob; blob=$(git hash-object -w "$1")
+        git update-index --add --cacheinfo "100644,$blob,$2"
+      }
+      export GIT_INDEX_FILE="$STAGE/index"
+      git read-tree --empty
+      add_blob "$ARTIFACTS_DIR/investigation.md"          ".archon-run/issue-$N/plan.md"
+      add_blob "$ARTIFACTS_DIR/contracts/impl.json"       ".archon-run/issue-$N/contracts/impl.json"
+      add_blob "$ARTIFACTS_DIR/contracts/audit-notes.md"  ".archon-run/issue-$N/contracts/audit-notes.md"
+      add_blob "$STAGE/base-branch"                       ".archon-run/issue-$N/base-branch"
+      TREE=$(git write-tree)
+      HANDOFF=$(git commit-tree "$TREE" -m "archon handoff for #$N [s1-1cm3-2km3-m3]")
+      unset GIT_INDEX_FILE
+      git update-ref "$REF" "$HANDOFF"
+
+      # Work branch start point: CLEAN base tip (HEAD is origin/$BASE after
+      # resolve-base-branch) by default, or an explicit commit/branch when the
+      # 'from:<ref>' override is supplied. Created WITHOUT checking it out so p2 claims it.
+      START=HEAD
+      if [ -n "$FROM" ]; then
+        git fetch origin "$FROM" --quiet 2>/dev/null || true
+        # MSYS guard: on Git Bash/Windows the '^{commit}' peel + slashes get mangled
+        # (':'->';', '/'->'\'); disable arg conversion (no-op on Linux/WSL).
+        START=$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git rev-parse --verify "origin/$FROM^{commit}" 2>/dev/null \
+             || MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git rev-parse --verify "$FROM^{commit}" 2>/dev/null) \
+             || { echo "freeze: from:$FROM not resolvable" >&2; exit 1; }
+        echo "freeze: work branch starting from override ref $FROM ($START)" >&2
+      fi
+      git branch -f "$BR" "$START"
+      echo "p1 froze handoff for #$N -> $REF @ $(git rev-parse --short "$HANDOFF"); work branch $BR @ $(git rev-parse --short "$BR") (base=$BASE${FROM:+, from=$FROM})"
+      echo "Next: archon workflow run archonx-fix-github-issue-p2-3kc $N${SFX:+ $SFX}"

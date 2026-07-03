@@ -1,4 +1,4 @@
-name: archon2-pr-review-m27.m3-deep
+name: archonx-pr-review-m27-m3-deep
 description: |
   Use when: User wants the MOST THOROUGH possible PR review on cheap models, trading time
   for depth. Built for MiniMax (credits are cheap — make it work hard; runtime irrelevant).
@@ -12,7 +12,7 @@ description: |
   ARCHON2 DEEP REVIEW VARIANT (naming: see .archon/workflows/NAMING.md; "-deep" qualifier).
   Premise (see agent memory feedback_minimax_cheap_work_hard): MiniMax under-detects on a
   single pass, but credits are cheap and time doesn't matter — so compensate with MORE work,
-  not a pricier model. Four force-multipliers over the lean archon2-pr-review-m27.m3:
+  not a pricier model. Four force-multipliers over the lean archonx-pr-review-m27.m3:
     1. Per-file deep dives  — one focused review per changed file (M2.7), not one big-context pass.
     2. Dual-framing cross-checks — every file reviewed twice: ATTACK ("a bug exists, find it")
        and VERIFY ("prove each change is correct"); findings are unioned.
@@ -43,14 +43,36 @@ nodes:
       export PATH="$PATH:/home/user/.local/bin"
       set -uo pipefail
       mkdir -p "$ARTIFACTS_DIR/review/deep"
-      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null || gh pr view --json number -q '.number')
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
+      fi
+      if [ -z "$PR_NUMBER" ]; then PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null); fi
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        echo "FATAL: could not resolve PR number (artifact=empty, ARGUMENTS=${ARGUMENTS:-})" >&2
+        exit 1
+      fi
       echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
       BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      echo "$BASE" > "$ARTIFACTS_DIR/.pr-base"
       git fetch origin "$BASE" --quiet || true
+      # DETERMINISTICALLY land the worktree ON the PR head. The LLM-driven `sync` node is
+      # supposed to `git checkout $PR_HEAD`, but it flakes (cheap M2.7) and leaves the worktree
+      # on the base tip (worktree was created --from BASE), so "origin/$BASE...HEAD" diffed
+      # base-branch drift, NOT the PR (confirmed bug, #100/#99). Unlike the read-only m3.m3
+      # review, this workflow's FIXER edits source and pushes, so it MUST be on the real PR head
+      # branch (so `git push origin HEAD` updates the PR). Pin head by SHA, check it out onto the
+      # PR's actual head-ref branch name.
+      PR_HEAD_REF=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName')
+      git fetch origin "pull/$PR_NUMBER/head" --quiet || true
+      PRHEAD=$(git rev-parse FETCH_HEAD)
+      echo "$PRHEAD" > "$ARTIFACTS_DIR/.pr-head-sha"
+      git switch -C "$PR_HEAD_REF" "$PRHEAD" || git checkout -B "$PR_HEAD_REF" "$PRHEAD"
+      echo "enumerate-files: worktree now on PR head $PR_HEAD_REF @ $PRHEAD vs origin/$BASE"
       # Changed files in the PR, excluding deletions (nothing to review in a removed file).
-      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" > "$ARTIFACTS_DIR/review/files.txt"
+      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" | { grep -vE '^[.]archive/' || true; } > "$ARTIFACTS_DIR/review/files.txt"
       : > "$ARTIFACTS_DIR/review/reviewed.txt"
-      TOTAL=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0)
+      TOTAL=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0; } | tail -1 )
       echo "deep review queue: $TOTAL changed file(s) vs origin/$BASE"
       cat "$ARTIFACTS_DIR/review/files.txt" | sed 's/^/  /'
 
@@ -117,8 +139,8 @@ nodes:
       max_iterations: 200
       fresh_context: true
       until_bash: |
-        total=$(grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0)
-        done=$(grep -c . "$ARTIFACTS_DIR/review/reviewed.txt" 2>/dev/null || echo 0)
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed.txt" 2>/dev/null || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ── Aggregate all per-file findings into the consolidated review + post ──

@@ -1,0 +1,503 @@
+name: archonx-pr-spec-review-p5a-m3m3
+description: |
+  Use when: User wants a PR reviewed against what its SPEC actually requires (the issue body
+  PLUS the ADRs / PRD / design docs / GLOSSARY it cites) — an anti-omission coverage review,
+  not general code taste. Single PR.
+  Triggers: "spec review PR", "pr-spec-review #123", "review PR against spec", "spec-faithful?".
+  Does: resolve PR + linked issue -> assemble the authoritative spec -> extract a requirement
+        checklist -> per-requirement, find the enforcing evidence in the diff (Met / Gap /
+        dependency-gated stub / behavioral-change risk) -> consolidated verdict -> post to PR.
+  NOT for: multi-PR cross-cutting/merge-order analysis (that is the batch form of the skill),
+           bug-vs-fix E2E validation (use archon-validate-pr-m3), fixing issues.
+
+  Ported from the Claude Code skill `pr-spec-review` (single-PR form) for use as grey-factory
+  stage P5 (spec-faithfulness review). Reproducible-by-construction: every finding cites a quoted
+  requirement AND the diff evidence (or its absence). Read-only — never modifies or merges the PR.
+
+  ── P5 MODEL VARIANTS — trailing letter = the per-requirement REVIEW mind ──
+  The CHECKLIST seat is fixed on MiniMax-M3 (cheap requirement enumeration). The variant letter
+  swaps only the per-requirement coverage REVIEW mind (the judgment seat):
+    -m3  MiniMax-M3  (cheap default; same single-call timeout discipline = one requirement/iter)
+    -c   codex/gpt-5.4  (strong cross-mind; codex credits permitting)
+    -o   claude/opus    (strongest cross-mind; when opus credits available)
+  Aggregate stays M2.7 (trivial). Read-only across all variants.
+
+  STRUCTURE: mirrors archon-validate-pr-m3's resilient per-item loop so MiniMax-M3 never gets
+  the whole diff in one shot (avoids the ~500s pi->M3 timeout). The work queue here is the
+  REQUIREMENT CHECKLIST (walk the checklist, not the diff — that is what makes it anti-omission).
+  PR head is pinned by SHA and everything diffs origin/<base>...<prhead> (avoids the
+  worktree-is-not-the-PR-branch false-verdict bug).
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: RESOLVE — PR, linked issue, base, pinned head SHA
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fetch-pr
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/spec" "$ARTIFACTS_DIR/req"
+      # Resolve PR number: first integer in ARGUMENTS -> PR of current branch.
+      PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
+      if [ -z "$PR_NUMBER" ]; then PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1); fi
+      if [ -z "$PR_NUMBER" ]; then PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null); fi
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        echo "FATAL: no PR number in ARGUMENTS=${ARGUMENTS:-} and branch has no PR" >&2; exit 1
+      fi
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+
+      BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      echo "$BASE" > "$ARTIFACTS_DIR/.pr-base"
+      git fetch origin "$BASE" --quiet || true
+      git fetch origin "pull/$PR_NUMBER/head" --quiet || true
+      PRHEAD=$(git rev-parse FETCH_HEAD)
+      echo "$PRHEAD" > "$ARTIFACTS_DIR/.pr-head-sha"
+
+      # Linked issue: "Fixes/Closes/Resolves #N" in the PR body, else first #N.
+      BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body')
+      ISSUE=$(echo "$BODY" | grep -oiE '(fix|fixe[sd]|close[sd]?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE" ]; then ISSUE=$(echo "$BODY" | grep -oE '#[0-9]+' | grep -oE '[0-9]+' | head -1); fi
+      echo "${ISSUE:-}" > "$ARTIFACTS_DIR/.issue-number"
+
+      echo "pr-spec-review: PR #$PR_NUMBER  base=$BASE  head=$PRHEAD  issue=#${ISSUE:-none}"
+      gh pr view "$PR_NUMBER" --json number,title,body,url,headRefName,baseRefName,files,additions,deletions,changedFiles,state,author,labels,isDraft
+
+  # ── Gather the authoritative spec sources: issue body + every doc it names ──
+  - id: resolve-spec-sources
+    depends_on: [fetch-pr]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number"); ISSUE=$(cat "$ARTIFACTS_DIR/.issue-number")
+      BASE=$(cat "$ARTIFACTS_DIR/.pr-base"); PRHEAD=$(cat "$ARTIFACTS_DIR/.pr-head-sha")
+
+      # Issue body (the primary spec) — necessary but not sufficient.
+      if [ -n "$ISSUE" ]; then
+        gh issue view "$ISSUE" --json number,title,body > "$ARTIFACTS_DIR/spec/issue.json" 2>/dev/null || true
+        gh issue view "$ISSUE" --json body -q '.body' > "$ARTIFACTS_DIR/spec/issue-body.md" 2>/dev/null || true
+      else
+        : > "$ARTIFACTS_DIR/spec/issue-body.md"
+      fi
+
+      # Named docs: any path the issue/PR body references (ADRs, PRD, *-spec.md, GLOSSARY).
+      # Copy the base-branch version of each so we score against the spec, not the PR's own edits.
+      REFS=$( { cat "$ARTIFACTS_DIR/spec/issue-body.md"; gh pr view "$PR" --json body -q '.body'; } \
+        | grep -oE '(docs/adr/[0-9A-Za-z._/-]+\.md|[A-Za-z0-9._/-]*PRD[A-Za-z0-9._/-]*\.md|[A-Za-z0-9._/-]*-spec\.md|GLOSSARY\.md|CLAUDE\.md)' \
+        | sort -u )
+      echo "$REFS" > "$ARTIFACTS_DIR/spec/.refs.txt"
+      for f in $REFS; do
+        dest="$ARTIFACTS_DIR/spec/$(echo "$f" | tr '/' '_')"
+        git show "origin/$BASE:$f" > "$dest" 2>/dev/null && echo "  spec source: $f" || echo "  (missing on base: $f)"
+      done
+      # Standing project rules are requirements too.
+      git show "origin/$BASE:CLAUDE.md" > "$ARTIFACTS_DIR/spec/_CLAUDE.md" 2>/dev/null || true
+
+      # The diff under review, pinned by SHA, .archive excluded.
+      git diff --name-only --diff-filter=d "origin/$BASE...$PRHEAD" | { grep -vE '^[.]archive/' || true; } > "$ARTIFACTS_DIR/req/files.txt"
+      echo "changed files:"; sed 's/^/  /' "$ARTIFACTS_DIR/req/files.txt"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: CHECKLIST — flatten the spec into verifiable requirements
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: build-checklist
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [resolve-spec-sources]
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Build the REQUIREMENT CHECKLIST this PR will be scored against. Walk the spec, not the diff.
+
+      ## Read the authoritative spec (only these — bounded input)
+      - Issue body: `$ARTIFACTS_DIR/spec/issue-body.md`
+      - Every cited doc copied into `$ARTIFACTS_DIR/spec/` (ADRs, PRD, *-spec, GLOSSARY) —
+        list with `ls $ARTIFACTS_DIR/spec/`. ADRs own the DECISION (polarity, ordering, encoding,
+        recovery semantics); the issue often only summarizes them — read the ADR, not the summary.
+      - Standing project rules in `$ARTIFACTS_DIR/spec/_CLAUDE.md` if present (e.g. VERSION bump +
+        .archive copy, "never modify file X", encoding/size invariants) — these ARE requirements.
+
+      ## Emit the checklist
+      One line per INDEPENDENTLY-VERIFIABLE assertion: deliverable bullets, how-to-test bullets,
+      ADR decisions, named constraints. Be specific and falsifiable (include concrete values:
+      offsets, encodings, sizes, magic bytes, version numbers) taken from the authoritative doc.
+
+      Write `$ARTIFACTS_DIR/req/requirements.txt`, one requirement per line, format:
+        R<NN>\t<concise requirement text with concrete expected value>
+      Also create an empty `$ARTIFACTS_DIR/req/reviewed.txt`.
+      Do NOT invent requirements the spec does not state. If a PR has no resolvable spec doc and
+      only a thin issue body, base the checklist on the issue body alone and note that at the top.
+      Output a one-line count confirmation only.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: COVERAGE — one requirement per iteration, find enforcing evidence
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-requirements
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [build-checklist]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Spec coverage (ONE requirement) — find the enforcing evidence in the diff, or its absence
+
+        TIMEOUT DISCIPLINE: handle exactly ONE requirement this iteration. Be CONCISE.
+
+        ## Pick your requirement
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/req/reviewed.txt" "$ARTIFACTS_DIR/req/requirements.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`.) If EMPTY, the queue is drained:
+        output `QUEUE EMPTY` and stop (review nothing). Else let REQ be that line (id + text).
+
+        ## Find the evidence (read only what you need)
+        - PR head SHA: `PRHEAD=$(cat $ARTIFACTS_DIR/.pr-head-sha)`; BASE: `BASE=$(cat $ARTIFACTS_DIR/.pr-base)`.
+        - The change for a file: `git diff "origin/$BASE...$PRHEAD" -- <file>`.
+        - A file's PR-head contents: `git show "$PRHEAD:<file>"` (do NOT `cat <file>` — the
+          worktree may not be the PR branch). Changed files: `cat $ARTIFACTS_DIR/req/files.txt`.
+
+        ## Classify REQ as exactly one of:
+        - **Met** — cite the file + line/construct that EXECUTES or ASSERTS it (a comment claiming
+          it is NOT met). Verify concrete values (offset/encoding/size/version) against the spec.
+        - **Gap** — required, not enforced by the diff. State what is missing.
+        - **Stub (dependency-gated)** — seam exists but intentionally inert (prereq issue not built);
+          legitimate, but say the deliverable is only partially live and flag any doc that over-claims.
+        - **Risk (behavioral-change)** — spec-faithful but changes existing behavior the spec did not
+          call out; name the assumption that makes it safe.
+
+        ## Write `$ARTIFACTS_DIR/req/$(echo REQ | grep -oE '^R[0-9]+').md`:
+        ```markdown
+        # <REQ id>: <requirement text>
+        **Status**: Met | Gap | Stub | Risk
+        - **Evidence**: file:line + the code/test that enforces it (or "none — <what's missing>")
+        - **Severity**: CRITICAL|HIGH|MEDIUM|LOW (for Gap/Risk; N/A for Met)
+        ```
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "REQ" >> "$ARTIFACTS_DIR/req/reviewed.txt"
+        ```
+        Then STOP your turn. Do NOT emit any completion phrase — a deterministic queue check
+        (until_bash below) ends the loop ONLY when reviewed.txt covers every requirement. This is
+        why the model can never declare the review "done" early: coverage is bash-authoritative.
+      # `until` is set to a sentinel the prompt NEVER emits, so the model's self-declaration can no
+      # longer stop the loop (the old `until: REQS_DONE` let M3 quit at 18/28 — completionDetected =
+      # signalDetected || bashComplete, so a premature REQS_DONE ended it). Now ONLY until_bash (the
+      # real queue: reviewed >= total) stops it. A non-zero until_bash = "not done, keep going".
+      until: __LOOP_ENDS_VIA_UNTIL_BASH_ONLY__
+      max_iterations: 60
+      fresh_context: true
+      until_bash: |
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Resilience: resume if the loop died mid-queue (silent provider stream close is not retried) ──
+  - id: req-status
+    depends_on: [review-requirements]
+    trigger_rule: all_done
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      total=$( { grep -c . "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+      done=$( { sort -u "$ARTIFACTS_DIR/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+      if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
+
+  - id: review-requirements-resume
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [req-status]
+    when: "$req-status.output == 'MORE'"
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Spec coverage (RESUME) — finish the requirements the dead loop didn't reach. ONE per iteration.
+
+        TIMEOUT DISCIPLINE: one requirement, concise.
+
+        ## Pick your requirement
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/req/reviewed.txt" "$ARTIFACTS_DIR/req/requirements.txt" | head -1
+        ```
+        (Plain grep — NO process substitution.) If EMPTY, the queue is drained: output `QUEUE EMPTY` and stop.
+
+        ## Same context, classification, and per-requirement file format as the main coverage pass
+        (origin/$BASE...$PRHEAD by SHA; Met/Gap/Stub/Risk; write `$ARTIFACTS_DIR/req/<Rid>.md`).
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "REQ" >> "$ARTIFACTS_DIR/req/reviewed.txt"
+        ```
+        Then STOP your turn. Do NOT emit any completion phrase — until_bash ends the loop only when
+        reviewed.txt covers every requirement.
+      until: __LOOP_ENDS_VIA_UNTIL_BASH_ONLY__
+      max_iterations: 60
+      fresh_context: true
+      until_bash: |
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ═══════════════════════════════════════════════════════════════
+  # --- PHASE 3b: ADVERSARIAL AUDIT -------------------------------------------
+  # A DIFFERENT mind judges each review finding for FALSE POSITIVES (REFUTED) and
+  # MISSES; emit-verdict then DEMOTES the refuted ones. The M3 reviewer over-flags
+  # (literal/dismissed items); this pass refutes the bogus findings with evidence,
+  # exactly as p3's M3.M3 pass-2 does. AUDITOR seat = the variant's 2nd model letter.
+  - id: audit-requirements
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [review-requirements-resume]
+    trigger_rule: all_done
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Adversarial audit (ONE requirement) - a DIFFERENT mind judging the reviewer's finding.
+
+        TIMEOUT DISCIPLINE: audit exactly ONE requirement this iteration. Be CONCISE.
+
+        ## Pick your requirement (a reviewed finding not yet audited)
+        ```bash
+        mkdir -p "$ARTIFACTS_DIR/req/audit"
+        for f in "$ARTIFACTS_DIR"/req/R*.md; do
+          [ -e "$f" ] || continue
+          rid=$(basename "$f" .md)
+          [ -f "$ARTIFACTS_DIR/req/audit/$rid.md" ] || { echo "$rid"; break; }
+        done
+        ```
+        If that prints NOTHING, the audit queue is drained: output `QUEUE EMPTY` and stop.
+        Else let RID be that id and read `$ARTIFACTS_DIR/req/$RID.md` (the reviewer's finding).
+
+        ## Judge it adversarially (you do NOT share the reviewer's assumptions)
+        - PRHEAD=$(cat $ARTIFACTS_DIR/.pr-head-sha); BASE=$(cat $ARTIFACTS_DIR/.pr-base).
+        - Verify vs reality: `git show "$PRHEAD:<file>"`, `git diff "origin/$BASE...$PRHEAD" -- <file>`,
+          and the cited spec in `$ARTIFACTS_DIR/spec/`. A Gap/Risk is REAL only if the diff truly fails
+          it. REFUTE it if over-literal, or actually satisfied elsewhere in the tree (cite the evidence).
+        - Note any MISS the reviewer marked Met but isn't.
+
+        ## Write `$ARTIFACTS_DIR/req/audit/$RID.md`:
+        ```markdown
+        # Audit <RID>
+        **AuditVerdict**: UPHELD | REFUTED
+        **Reason**: file:line + exact evidence (for REFUTED: what makes it actually satisfied)
+        **NetNew**: <CRITICAL|HIGH|MEDIUM|LOW> <one-line real miss>
+        ```
+        (Omit the NetNew line if there is no miss.)
+        Then STOP your turn. Do NOT emit any completion phrase - until_bash ends the loop only when
+        every reviewed requirement has an audit file.
+      until: __LOOP_ENDS_VIA_UNTIL_BASH_ONLY__
+      max_iterations: 60
+      fresh_context: true
+      until_bash: |
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        rev=$( ls "$A"/req/R*.md 2>/dev/null | grep -c . | tail -1 ); rev=${rev:-0}
+        aud=$( ls "$A"/req/audit/*.md 2>/dev/null | grep -c . | tail -1 ); aud=${aud:-0}
+        [ "$rev" -eq 0 ] || [ "$aud" -ge "$rev" ]
+
+  - id: audit-status
+    depends_on: [audit-requirements]
+    trigger_rule: all_done
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      rev=$( ls "$ARTIFACTS_DIR"/req/R*.md 2>/dev/null | grep -c . | tail -1 ); rev=${rev:-0}
+      aud=$( ls "$ARTIFACTS_DIR"/req/audit/*.md 2>/dev/null | grep -c . | tail -1 ); aud=${aud:-0}
+      if [ "$rev" -eq 0 ] || [ "$aud" -ge "$rev" ]; then printf DONE; else printf MORE; fi
+
+  - id: audit-requirements-resume
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [audit-status]
+    when: "$audit-status.output == 'MORE'"
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Adversarial audit (RESUME) - finish auditing the findings the dead loop didn't reach. ONE per iteration.
+
+        Pick the first `$ARTIFACTS_DIR/req/R*.md` whose `$ARTIFACTS_DIR/req/audit/<rid>.md` is missing
+        (mkdir -p the audit dir first). If none remain, output `QUEUE EMPTY` and stop. Otherwise judge
+        it adversarially against the PR head + cited spec and write `$ARTIFACTS_DIR/req/audit/<rid>.md`
+        with **AuditVerdict**: UPHELD|REFUTED, **Reason**, and an optional **NetNew**: <SEV> <miss>.
+        Then STOP your turn; emit no completion phrase.
+      until: __LOOP_ENDS_VIA_UNTIL_BASH_ONLY__
+      max_iterations: 60
+      fresh_context: true
+      until_bash: |
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        rev=$( ls "$A"/req/R*.md 2>/dev/null | grep -c . | tail -1 ); rev=${rev:-0}
+        aud=$( ls "$A"/req/audit/*.md 2>/dev/null | grep -c . | tail -1 ); aud=${aud:-0}
+        [ "$rev" -eq 0 ] || [ "$aud" -ge "$rev" ]
+
+  # PHASE 4: REPORT — consolidate + verdict, then post to the PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: aggregate
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [audit-requirements-resume]
+    trigger_rule: all_done
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Consolidate the per-requirement findings into one spec-review report. Do not invent findings —
+      only aggregate what the `$ARTIFACTS_DIR/req/R*.md` files contain.
+
+      Read every `$ARTIFACTS_DIR/req/R*.md`. Write `$ARTIFACTS_DIR/spec-review.md`:
+      - Header `# PR Spec Review: PR #<n>` (PR# from `cat $ARTIFACTS_DIR/.pr-number`), linked issue.
+      - **Verdict** (one line): `spec-faithful` | `faithful-with-risk` | `gaps-found`, with the single
+        most important reason. Any unresolved CRITICAL/HIGH Gap -> `gaps-found`.
+      - **Met** requirements: brief, grouped (don't pad).
+      - Every **Gap**, **Stub**, and **Risk**, each anchored to its requirement + the diff evidence
+        (or its absence), in severity order.
+      Keep it concise and falsifiable. Output a one-line confirmation only.
+
+  # ── Structured verdict (MECHANICAL — no LLM): parse the per-requirement R*.md files
+  #    into a gf-verdict/1 JSON block. The p6 merge-gate reads THIS, not the prose. ──
+  - id: emit-verdict
+    depends_on: [aggregate]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      "$PY" - << 'PYEOF'
+      import json, os, re, glob
+      A = os.environ["ARTIFACTS_DIR"]
+      def readf(p, d=""):
+          try:
+              return open(os.path.join(A, p), encoding="utf-8").read().strip()
+          except OSError:
+              return d
+      pr    = readf(".pr-number")
+      issue = readf(".issue-number")
+      base  = readf(".pr-base")
+      head  = readf(".pr-head-sha")
+      def count_lines(p):
+          try:
+              return sum(1 for l in open(os.path.join(A, p), encoding="utf-8") if l.strip())
+          except OSError:
+              return 0
+      def count_unique(p):
+          try:
+              return len({l.strip() for l in open(os.path.join(A, p), encoding="utf-8") if l.strip()})
+          except OSError:
+              return 0
+      total    = count_lines("req/requirements.txt")
+      # reviewed is computed BELOW as the count of per-requirement analysis files actually
+      # WRITTEN (R*.md) — NOT reviewed.txt lines. A model can echo reviewed.txt without doing
+      # the work (GLM did exactly that: 19 "reviewed" but 1 R-file -> hollow spec-faithful).
+      # Counting real artifacts makes reviewed_all un-fakeable.
+      findings = []
+      for f in sorted(glob.glob(os.path.join(A, "req", "R*.md"))):
+          txt = open(f, encoding="utf-8").read()
+          rid = os.path.splitext(os.path.basename(f))[0]
+          m = re.search(r'^#\s*(.+)$', txt, re.M)
+          title = (m.group(1).strip() if m else rid)
+          ms = re.search(r'\*\*Status\*\*:\s*([A-Za-z]+)', txt)
+          status = (ms.group(1).strip().capitalize() if ms else "Unknown")
+          mv = re.search(r'\*\*Severity\*\*:\s*([A-Za-z/]+)', txt)
+          sev = (mv.group(1).strip().upper() if mv else "N/A")
+          findings.append({"req": rid, "status": status, "severity": sev, "text": title})
+      reviewed = len(findings)   # AUTHORITATIVE: count of R*.md artifacts actually produced
+      # Adversarial-audit reconciliation: REFUTED Gap/Risk -> demoted to Met; audit NET-NEW added.
+      audited = 0; refuted = 0; netnew = []
+      adir = os.path.join(A, "req", "audit")
+      for f in findings:
+          ap = os.path.join(adir, f["req"] + ".md")
+          if not os.path.exists(ap):
+              continue
+          audited += 1
+          atxt = open(ap, encoding="utf-8").read()
+          av = re.search(r"\*\*AuditVerdict\*\*:\s*([A-Za-z]+)", atxt)
+          if av and av.group(1).strip().upper() == "REFUTED" and f["status"] in ("Gap", "Risk"):
+              f["status"] = "Met"; f["severity"] = "N/A"; f["refuted"] = True; refuted += 1
+          nn = re.search(r"\*\*NetNew\*\*:\s*([A-Za-z]+)\s+(.+)", atxt)
+          if nn:
+              netnew.append({"req": f["req"] + "-audit", "status": "Gap",
+                             "severity": nn.group(1).strip().upper(),
+                             "text": "[AUDIT] " + nn.group(2).strip()[:120]})
+      findings += netnew
+      def sev_in(f, s): return f["severity"] in s
+      counts = {"total": total, "reviewed": reviewed,
+                "met":  sum(1 for f in findings if f["status"] == "Met"),
+                "gap":  sum(1 for f in findings if f["status"] == "Gap"),
+                "stub": sum(1 for f in findings if f["status"] == "Stub"),
+                "risk": sum(1 for f in findings if f["status"] == "Risk")}
+      counts.update({"audited": audited, "refuted": refuted, "netnew": len(netnew)})
+      by_sev = {s: sum(1 for f in findings if f["severity"] == s)
+                for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
+      gaprisk   = [f for f in findings if f["status"] in ("Gap", "Risk")]
+      blocking  = [f for f in gaprisk if sev_in(f, ("CRITICAL", "HIGH"))]
+      deferrable= [f for f in gaprisk if sev_in(f, ("MEDIUM", "LOW"))]
+      stubs     = [f for f in findings if f["status"] == "Stub"]
+      reviewed_all = total > 0 and reviewed >= total
+      verdict = "spec-faithful"
+      if any(f["status"] == "Gap" and sev_in(f, ("CRITICAL", "HIGH")) for f in findings):
+          verdict = "gaps-found"
+      elif gaprisk:
+          verdict = "faithful-with-risk"
+      out = {"schema": "gf-verdict/1", "stage": "p5",
+             "pr": int(pr) if pr.isdigit() else pr,
+             "issue": int(issue) if issue.isdigit() else issue,
+             "head_sha": head, "base": base,
+             "counts": counts, "by_severity": by_sev,
+             "reviewed_all": reviewed_all,
+             "blocking": blocking, "deferrable": deferrable, "stubs": stubs,
+             "verdict": verdict}
+      open(os.path.join(A, "verdict.json"), "w", encoding="utf-8").write(json.dumps(out, indent=2))
+      print(f"verdict: {verdict} reviewed={reviewed}/{total} audited={audited} refuted={refuted} blocking={len(blocking)} deferrable={len(deferrable)}")
+      PYEOF
+
+  - id: post-report
+    depends_on: [emit-verdict]
+    trigger_rule: all_done
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number")
+      BODY="$ARTIFACTS_DIR/spec-review.md"
+      if [ -s "$BODY" ]; then
+        # gf-stage marker: lets the grey-factory orchestrator detect THIS stage's artifact
+        # (the p5 spec-review, posted as a PR review body) as done.
+        printf '\n\n<!-- gf-stage:p5 -->\n' >> "$BODY"
+        # gf-verdict block (machine-readable; HTML comment so it never renders) — p6 reads this.
+        if [ -s "$ARTIFACTS_DIR/verdict.json" ]; then
+          printf '<!-- gf-verdict:p5\n' >> "$BODY"
+          cat "$ARTIFACTS_DIR/verdict.json" >> "$BODY"
+          printf '\n-->\n' >> "$BODY"
+        fi
+        # Map the report verdict -> GitHub PR review STATE (post into the PR review thread).
+        #   spec-faithful -> APPROVE   gaps-found -> REQUEST_CHANGES   else -> COMMENT
+        # Priority order matters ('faithful-with-risk' contains 'faithful').
+        V=""
+        for tok in gaps-found faithful-with-risk spec-faithful; do
+          grep -qiE "$tok" "$BODY" && { V="$tok"; break; }
+        done
+        case "$V" in
+          gaps-found)    ACTION="--request-changes" ;;
+          spec-faithful) ACTION="--approve" ;;
+          *)             ACTION="--comment" ;;   # faithful-with-risk or verdict not found
+        esac
+        echo "verdict='${V:-unknown}' -> gh pr review $ACTION"
+        # GitHub forbids approving your OWN PR -> fall back to a review comment, then a plain comment.
+        if gh pr review "$PR" $ACTION --body-file "$BODY"; then
+          echo "posted spec-review as PR review ($ACTION) to PR #$PR"
+        elif gh pr review "$PR" --comment --body-file "$BODY"; then
+          echo "WARN: $ACTION rejected (self-approve?); posted as review COMMENT to PR #$PR"
+        else
+          gh pr comment "$PR" --body-file "$BODY" \
+            && echo "WARN: pr review failed; posted as plain PR comment to #$PR" \
+            || echo "WARN: all posting failed; report is at $BODY"
+        fi
+      else
+        echo "WARN: no spec-review.md produced — nothing posted"
+      fi

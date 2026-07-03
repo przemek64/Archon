@@ -9,6 +9,8 @@ description: |
   Optional: Install the remotion-best-practices skill for higher quality output:
             npx skills add remotion-dev/skills
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   # ── Layer 0: Check project structure ──────────────────────────────────
   - id: check-project
@@ -125,4 +127,3 @@ nodes:
     depends_on: [render-video]
     allowed_tools:
       - Read
-    model: small

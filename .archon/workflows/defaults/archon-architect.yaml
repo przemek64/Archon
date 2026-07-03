@@ -12,7 +12,8 @@ description: |
   - PreToolUse hooks inject architectural principles before changes
   - Different nodes have different trust levels and steering
 
-provider: claude
+provider: pi
+model: minimax/MiniMax-M2.7
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -65,6 +66,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: analyze
+    provider: claude
+    model: opus
     prompt: |
       You are a senior software architect performing a codebase health assessment.
 
@@ -119,6 +122,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: plan
+    provider: claude
+    model: opus
     prompt: |
       You are planning targeted architectural improvements.
 
@@ -156,6 +161,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: simplify
+    provider: codex
+    model: gpt-5.5
     prompt: |
       You are implementing targeted architectural simplifications.
 
@@ -253,6 +260,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: fix-failures
+    provider: codex
+    model: gpt-5.5
     prompt: |
       Review the validation output below.
 

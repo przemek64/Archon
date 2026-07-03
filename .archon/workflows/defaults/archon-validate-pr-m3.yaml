@@ -1,0 +1,504 @@
+name: archon-validate-pr-m3
+description: |
+  Use when: User wants a thorough PR validation (tests both main = bug present and feature
+  branch = bug fixed) but driven by MiniMax-M3 instead of codex/gpt-5.5 — a cost/quality
+  experiment forked from archon-validate-pr.
+  Triggers: "validate PR m3", "m3 validate pr #123", "validate pr with m3", "m3 pr validation".
+  Does: Fetches PR info -> finds free ports -> per-file code review (main vs feature) ->
+        E2E test on main (reproduce bug) -> E2E test on feature (verify fix) -> final verdict report.
+  NOT for: Quick code-only reviews (use archon-smart-pr-review / archonx-pr-review-m3.m3),
+           fixing issues, general exploration.
+
+  M3 VARIANT (forked from archon-validate-pr 2026-06-19). The three quality nodes —
+  code-review-main, code-review-feature, final-report — run on pi/minimax/MiniMax-M3.
+
+  TIMEOUT FIX (2026-06-19): the original M3 code-review nodes fed M3 the WHOLE diff in a
+  single shot and timed out on large PRs (~500s pi->MiniMax request window; run c5672685
+  died here). Now ported the per-file queue pattern from archonx-pr-review-m3.m3:
+    1. enumerate-files builds a shared work queue of changed files (robust PR# resolution).
+    2. code-review-main / code-review-feature are LOOPS bound to ONE file per iteration, so
+       no single M3 request carries the whole diff -> each finishes well under the window.
+    3. agg-main / agg-feature (cheap M2.7) concatenate the per-file findings back into the
+       consolidated code-review-main.md / code-review-feature.md the report node expects.
+    4. final-report keeps trigger_rule:all_done so it publishes whatever the loops produced
+       even if one iteration times out.
+
+  This workflow is designed for running in parallel — each instance finds its own free ports
+  to avoid conflicts. Produces artifacts in $ARTIFACTS_DIR/ and posts a validation report.
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: SETUP — Fetch PR info and allocate ports
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fetch-pr
+    bash: |
+      # Extract PR number from arguments
+      PR_NUMBER=$(echo "$ARGUMENTS" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
+      # Fallback: extract first number if no URL path found (e.g., "validate PR 42")
+      if [ -z "$PR_NUMBER" ]; then
+        PR_NUMBER=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+      fi
+      if [ -z "$PR_NUMBER" ]; then
+        # Try getting PR from current branch
+        PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+      fi
+
+      if [ -z "$PR_NUMBER" ]; then
+        echo "ERROR: No PR number found in arguments: $ARGUMENTS"
+        exit 1
+      fi
+
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+
+      # Fetch full PR details
+      gh pr view "$PR_NUMBER" --json number,title,body,url,headRefName,baseRefName,files,additions,deletions,changedFiles,state,author,labels,isDraft
+
+  - id: find-ports
+    bash: |
+      # Use Bun to let the OS pick truly free ports (cross-platform: Linux, macOS, Windows)
+      BACKEND_PORT=$(bun -e "const s = Bun.serve({port: 0, fetch: () => new Response('')}); console.log(s.port); s.stop()")
+      FRONTEND_PORT=$(bun -e "const s = Bun.serve({port: 0, fetch: () => new Response('')}); console.log(s.port); s.stop()")
+
+      echo "$BACKEND_PORT" > "$ARTIFACTS_DIR/.backend-port"
+      echo "$FRONTEND_PORT" > "$ARTIFACTS_DIR/.frontend-port"
+
+      echo "BACKEND_PORT=$BACKEND_PORT"
+      echo "FRONTEND_PORT=$FRONTEND_PORT"
+
+  - id: resolve-paths
+    bash: |
+      # Resolve canonical repo path (main branch) vs worktree path (feature branch)
+      CANONICAL_REPO=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git$||')
+      WORKTREE_PATH=$(pwd)
+      FEATURE_BRANCH=$(git branch --show-current)
+
+      # Get PR branch info
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName')
+      PR_BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+
+      echo "$CANONICAL_REPO" > "$ARTIFACTS_DIR/.canonical-repo"
+      echo "$WORKTREE_PATH" > "$ARTIFACTS_DIR/.worktree-path"
+      echo "$FEATURE_BRANCH" > "$ARTIFACTS_DIR/.feature-branch"
+      echo "$PR_HEAD" > "$ARTIFACTS_DIR/.pr-head"
+      echo "$PR_BASE" > "$ARTIFACTS_DIR/.pr-base"
+
+      echo "CANONICAL_REPO=$CANONICAL_REPO"
+      echo "WORKTREE_PATH=$WORKTREE_PATH"
+      echo "FEATURE_BRANCH=$FEATURE_BRANCH"
+      echo "PR_HEAD=$PR_HEAD"
+      echo "PR_BASE=$PR_BASE"
+    depends_on: [fetch-pr]
+
+  # ── Enumerate changed files into a work queue shared by both M3 code-review passes ──
+  - id: enumerate-files
+    depends_on: [resolve-paths]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/review/main" "$ARTIFACTS_DIR/review/feature"
+      # Resolve PR number robustly (same hardening as archonx-pr-review-m3.m3's enumerate-files):
+      # artifact (only if a real integer) -> first number in run ARGUMENTS -> gh pr view on branch.
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
+      fi
+      if [ -z "$PR_NUMBER" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+      fi
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        echo "FATAL: could not resolve PR number (artifact=empty, ARGUMENTS=${ARGUMENTS:-}, branch has no PR)" >&2
+        exit 1
+      fi
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+      echo "enumerate-files: resolved PR #$PR_NUMBER"
+      BASE=$(cat "$ARTIFACTS_DIR/.pr-base" 2>/dev/null | tr -d ' \n')
+      if [ -z "$BASE" ]; then BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName'); fi
+      git fetch origin "$BASE" --quiet || true
+      # Pin the PR head by SHA, fetched explicitly — do NOT trust the worktree to be the PR
+      # branch (a validate run's worktree is a fresh branch off main; HEAD would have an EMPTY
+      # diff -> false verdict). Everything downstream diffs origin/$BASE...$PRHEAD by SHA.
+      git fetch origin "pull/$PR_NUMBER/head" --quiet || true
+      PRHEAD=$(git rev-parse FETCH_HEAD)
+      echo "$PRHEAD" > "$ARTIFACTS_DIR/.pr-head-sha"
+      echo "enumerate-files: PR head SHA $PRHEAD vs origin/$BASE"
+      git diff --name-only --diff-filter=d "origin/$BASE...$PRHEAD" | { grep -vE '^[.]archive/' || true; } > "$ARTIFACTS_DIR/review/files.txt"
+      : > "$ARTIFACTS_DIR/review/reviewed-main.txt"
+      : > "$ARTIFACTS_DIR/review/reviewed-feature.txt"
+      TOTAL=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" || echo 0; } | tail -1 )
+      echo "validate-m3 queue: $TOTAL changed file(s) vs origin/$BASE"
+      cat "$ARTIFACTS_DIR/review/files.txt" | sed 's/^/  /'
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: CODE REVIEW — per-file M3 loops (main = bug present, feature = fix correct)
+  # ═══════════════════════════════════════════════════════════════
+
+  # ── code-review-main: confirm the bug/gap exists on the BASE branch, ONE file per iteration ──
+  - id: code-review-main
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [enumerate-files]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Main-branch review (one file) — confirm the bug/gap the PR claims exists, on BASE
+
+        TIMEOUT DISCIPLINE: review exactly ONE file this iteration. Be CONCISE — no preamble,
+        go straight to the assessment. This keeps the request short.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed-main.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>MAIN_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Context (read only what you need)
+        - PR claim: `PR=$(cat $ARTIFACTS_DIR/.pr-number); gh pr view "$PR" --json title,body`
+          and the linked issue if any (`Fixes/Closes/Resolves #N` in the body).
+        - The version of FILE **on the base branch** (the pre-PR state):
+          `BASE=$(cat $ARTIFACTS_DIR/.pr-base); git show "origin/$BASE:FILE"`
+          (if absent, FILE is new in the PR — note that).
+
+        ## Assess (for FILE only)
+        - Is the claimed bug/gap actually present in this file on base? CONFIRMED | NOT_FOUND | PARTIAL.
+        - Root cause with exact `FILE:line` evidence.
+        - Severity (user impact, frequency, core-feature, data-loss risk).
+
+        ## Write to `$ARTIFACTS_DIR/review/main/$(echo FILE | tr '/.' '__').md`:
+        ```markdown
+        # Main review: FILE
+        **Bug present on base?**: CONFIRMED | NOT_FOUND | PARTIAL
+        - **Location**: FILE:line
+        - **Evidence**: exact code / reasoning showing the bug or its absence
+        - **Severity**: CRITICAL|HIGH|MEDIUM|LOW + one-line justification
+        ```
+        If the file is unrelated to the claim, write a one-line "not relevant to claim" note.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/reviewed-main.txt"
+        ```
+        Then if files remain, emit NOTHING (loop continues); else output `<promise>MAIN_DONE</promise>`.
+      until: MAIN_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed-main.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Resilience: if code-review-main died mid-queue (silent provider stream close, which is
+  # NOT retried), resume the remaining files. Mirrors archonx-pr-review-m3.m3's audit resume. ──
+  - id: main-status
+    depends_on: [code-review-main]
+    trigger_rule: all_done
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+      done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed-main.txt" 2>/dev/null || echo 0; } | tail -1 )
+      if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
+
+  - id: code-review-main-resume
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [main-status]
+    when: "$main-status.output == 'MORE'"
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Main-branch review (RESUME) — finish the files the dead loop didn't reach. ONE file/iteration.
+
+        TIMEOUT DISCIPLINE: review exactly ONE file this iteration. Be CONCISE.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed-main.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`.) If EMPTY -> output `<promise>MAIN_DONE</promise>` and stop.
+
+        ## Context
+        - PR claim: `PR=$(cat $ARTIFACTS_DIR/.pr-number); gh pr view "$PR" --json title,body`.
+        - Base version of FILE: `BASE=$(cat $ARTIFACTS_DIR/.pr-base); git show "origin/$BASE:FILE"` (absent => new file).
+
+        ## Assess (FILE only): is the claimed bug/gap present on base? CONFIRMED|NOT_FOUND|PARTIAL, root cause FILE:line, severity.
+
+        ## Write to `$ARTIFACTS_DIR/review/main/$(echo FILE | tr '/.' '__').md` (same format as the main pass).
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/reviewed-main.txt"
+        ```
+        Then if files remain emit NOTHING; else output `<promise>MAIN_DONE</promise>`.
+      until: MAIN_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed-main.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Aggregate per-file main findings into the consolidated file the report expects ──
+  - id: agg-main
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [code-review-main-resume]
+    trigger_rule: all_done
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Concatenate the per-file main-branch findings into one consolidated file.
+      Read every `$ARTIFACTS_DIR/review/main/*.md`. Write `$ARTIFACTS_DIR/code-review-main.md`
+      with: a header `# Main Branch Code Review: PR #<n>` (PR# from `cat $ARTIFACTS_DIR/.pr-number`),
+      a one-paragraph overall "is the bug real on base?" summary, then each per-file section in
+      severity order. Do not invent findings — only aggregate what the files contain.
+      Output a one-line confirmation only.
+
+  # ── code-review-feature: verify the fix on the FEATURE branch, ONE file per iteration ──
+  - id: code-review-feature
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [agg-main]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Feature-branch review (one file) — verify the PR's fix is correct, complete, minimal
+
+        TIMEOUT DISCIPLINE: review exactly ONE file this iteration. Be CONCISE — go straight to findings.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed-feature.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`, which fails in this bash env.)
+        If EMPTY -> output `<promise>FEATURE_DONE</promise>` and stop. Else let FILE be that path.
+
+        ## Context (read only what you need for FILE)
+        - The main-branch finding for FILE in `$ARTIFACTS_DIR/code-review-main.md`.
+        - The change: `BASE=$(cat $ARTIFACTS_DIR/.pr-base); PRHEAD=$(cat $ARTIFACTS_DIR/.pr-head-sha); git diff "origin/$BASE...$PRHEAD" -- "FILE"`.
+        - FILE's full PR-head contents: `PRHEAD=$(cat $ARTIFACTS_DIR/.pr-head-sha); git show "$PRHEAD:FILE"` (do NOT `cat FILE` — the worktree may not be the PR branch).
+        - The base version to compare: `BASE=$(cat $ARTIFACTS_DIR/.pr-base); git show "origin/$BASE:FILE"` (absent for new files).
+        - Project conventions: `cat CLAUDE.md` (if present).
+
+        ## Evaluate the fix in FILE (all aspects, be terse)
+        - Does it actually address the bug/gap found on base? correctness/completeness.
+        - Simplicity (KISS/YAGNI), edge cases, side effects, performance, type safety,
+          error handling, CLAUDE.md compliance, and MISSING changes this file implies.
+
+        ## Write to `$ARTIFACTS_DIR/review/feature/$(echo FILE | tr '/.' '__').md`:
+        ```markdown
+        # Feature review: FILE
+        **Fix addresses the bug?**: YES | PARTIALLY | NO
+        ## [SEVERITY] Title  (CRITICAL|HIGH|MEDIUM|LOW)
+        - **Location**: FILE:line
+        - **Problem**: what's wrong (or "none" if clean)
+        - **Fix**: concise fix
+        ```
+        If clean, write a one-line "no findings" note with why.
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/reviewed-feature.txt"
+        ```
+        Then if files remain, emit NOTHING; else output `<promise>FEATURE_DONE</promise>`.
+      until: FEATURE_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed-feature.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Resilience: resume feature review if its loop died mid-queue (the failure we hit on
+  # PR #88 r2: code-review-feature iteration 3 stream-closed). Same pattern as the main resume. ──
+  - id: feature-status
+    depends_on: [code-review-feature]
+    trigger_rule: all_done
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+      done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed-feature.txt" 2>/dev/null || echo 0; } | tail -1 )
+      if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
+
+  - id: code-review-feature-resume
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [feature-status]
+    when: "$feature-status.output == 'MORE'"
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Feature-branch review (RESUME) — finish the files the dead loop didn't reach. ONE file/iteration.
+
+        TIMEOUT DISCIPLINE: review exactly ONE file this iteration. Be CONCISE.
+
+        ## Pick your file
+        ```bash
+        grep -vxF -f "$ARTIFACTS_DIR/review/reviewed-feature.txt" "$ARTIFACTS_DIR/review/files.txt" | head -1
+        ```
+        (Plain grep — NO process substitution `<(...)`.) If EMPTY -> output `<promise>FEATURE_DONE</promise>` and stop.
+
+        ## Context (read only what you need for FILE)
+        - The main-branch finding for FILE in `$ARTIFACTS_DIR/code-review-main.md`.
+        - The change: `BASE=$(cat $ARTIFACTS_DIR/.pr-base); PRHEAD=$(cat $ARTIFACTS_DIR/.pr-head-sha); git diff "origin/$BASE...$PRHEAD" -- "FILE"`.
+        - FILE's PR-head contents: `PRHEAD=$(cat $ARTIFACTS_DIR/.pr-head-sha); git show "$PRHEAD:FILE"` (do NOT `cat FILE`).
+        - Base version: `BASE=$(cat $ARTIFACTS_DIR/.pr-base); git show "origin/$BASE:FILE"` (absent => new file).
+
+        ## Evaluate the fix in FILE (terse): correctness/completeness vs the bug, simplicity, edge cases,
+        side effects, performance, type safety, error handling, CLAUDE.md compliance, MISSING changes.
+
+        ## Write to `$ARTIFACTS_DIR/review/feature/$(echo FILE | tr '/.' '__').md` (same format as the feature pass).
+
+        ## Mark done (exactly once, last):
+        ```bash
+        echo "FILE" >> "$ARTIFACTS_DIR/review/reviewed-feature.txt"
+        ```
+        Then if files remain emit NOTHING; else output `<promise>FEATURE_DONE</promise>`.
+      until: FEATURE_DONE
+      max_iterations: 200
+      fresh_context: true
+      until_bash: |
+        total=$( { grep -c . "$ARTIFACTS_DIR/review/files.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { grep -c . "$ARTIFACTS_DIR/review/reviewed-feature.txt" 2>/dev/null || echo 0; } | tail -1 )
+        [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
+
+  # ── Aggregate per-file feature findings + a verdict into the consolidated file ──
+  - id: agg-feature
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [code-review-feature-resume]
+    trigger_rule: all_done
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Concatenate the per-file feature-branch findings into one consolidated file.
+      Read every `$ARTIFACTS_DIR/review/feature/*.md`. Write `$ARTIFACTS_DIR/code-review-feature.md`
+      with: a header `# Feature Branch Code Review: PR #<n>`, a severity count table, each per-file
+      section in severity order, and a final line `**Verdict**: APPROVE | REQUEST_CHANGES |
+      NEEDS_DISCUSSION` derived from the findings (any unresolved CRITICAL/HIGH -> not APPROVE).
+      Do not invent findings — only aggregate. Output a one-line confirmation only.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: E2E TESTING — Sequential (after code reviews finish)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: classify-testability
+    prompt: |
+      You are a PR testability classifier. Determine whether this PR's changes can be
+      validated via browser E2E testing, or if it requires code-review-only validation.
+
+      ## PR Details
+
+      $fetch-pr.output
+
+      ## Rules
+
+      - **e2e_testable**: Changes affect the Web UI (components, hooks, styles, API routes
+        that serve the frontend, SSE streaming, layout, user-visible behavior). These can be
+        validated by starting Archon and using agent-browser to interact with the UI.
+      - **code_review_only**: Changes are purely backend logic, CLI-only, workflow engine,
+        database schemas, git operations, build tooling, tests, documentation, or other
+        non-UI code. No visual validation possible.
+
+      Consider: even if a change is backend, if it affects what the frontend displays
+      (e.g., API response format changes, SSE event changes), it IS e2e_testable.
+    depends_on: [fetch-pr]
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        testable:
+          type: string
+          enum: ["e2e_testable", "code_review_only"]
+        reasoning:
+          type: string
+        test_plan:
+          type: string
+      required: [testable, reasoning, test_plan]
+
+  - id: e2e-test-main
+    command: archon-validate-pr-e2e-main
+    depends_on: [classify-testability, find-ports, resolve-paths, agg-main, agg-feature]
+    when: "$classify-testability.output.testable == 'e2e_testable'"
+    context: fresh
+    idle_timeout: 1800000
+
+  - id: e2e-test-feature
+    command: archon-validate-pr-e2e-feature
+    depends_on: [e2e-test-main, find-ports, resolve-paths]
+    when: "$classify-testability.output.testable == 'e2e_testable'"
+    context: fresh
+    idle_timeout: 1800000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: FINAL REPORT — Synthesize all findings (M3)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: cleanup-processes
+    bash: |
+      # Safety net: kill any orphaned processes from E2E testing
+      # This runs after E2E nodes complete (or timeout/fail) to prevent process accumulation
+      BACKEND_PORT=$(cat "$ARTIFACTS_DIR/.backend-port" 2>/dev/null | tr -d '\n')
+      FRONTEND_PORT=$(cat "$ARTIFACTS_DIR/.frontend-port" 2>/dev/null | tr -d '\n')
+
+      if [ -z "$BACKEND_PORT" ] || [ -z "$FRONTEND_PORT" ]; then
+        echo "No port files found — skipping cleanup"
+        exit 0
+      fi
+
+      echo "Cleaning up ports $BACKEND_PORT and $FRONTEND_PORT..."
+
+      # Kill by all recorded PID files
+      for pidfile in "$ARTIFACTS_DIR"/.e2e-*-pid; do
+        if [ -f "$pidfile" ]; then
+          PID=$(cat "$pidfile" | tr -d '\n')
+          echo "Killing PID $PID from $pidfile"
+          kill "$PID" 2>/dev/null || taskkill //F //T //PID "$PID" 2>/dev/null || true
+        fi
+      done
+
+      # Kill by port (cross-platform fallback)
+      for PORT in $BACKEND_PORT $FRONTEND_PORT; do
+        fuser -k "$PORT/tcp" 2>/dev/null || true
+        lsof -ti:"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+        netstat -ano 2>/dev/null | grep ":$PORT " | grep LISTENING | awk '{print $5}' | sort -u | while read pid; do
+          taskkill //F //T //PID "$pid" 2>/dev/null || true
+        done
+      done
+
+      # pkill fallback: catch processes that escaped PID/port cleanup
+      pkill -f "PORT=$BACKEND_PORT.*bun" 2>/dev/null || true
+      pkill -f "vite.*port.*$FRONTEND_PORT" 2>/dev/null || true
+
+      # Close this workflow's browser session only (scoped by session ID)
+      BROWSER_SESSION=$(cat "$ARTIFACTS_DIR/.browser-session" 2>/dev/null | tr -d '\n')
+      if [ -n "$BROWSER_SESSION" ]; then
+        agent-browser --session "$BROWSER_SESSION" close 2>/dev/null || true
+      fi
+
+      # Remove main E2E worktree if it still exists (safety net)
+      CANONICAL_REPO=$(cat "$ARTIFACTS_DIR/.canonical-repo" 2>/dev/null | tr -d '\n')
+      MAIN_E2E_PATH=$(cat "$ARTIFACTS_DIR/.e2e-main-worktree" 2>/dev/null | tr -d '\n')
+      if [ -n "$MAIN_E2E_PATH" ] && [ -n "$CANONICAL_REPO" ] && [ -d "$MAIN_E2E_PATH" ]; then
+        echo "Removing leftover main E2E worktree: $MAIN_E2E_PATH"
+        git -C "$CANONICAL_REPO" worktree remove "$MAIN_E2E_PATH" --force 2>/dev/null || rm -rf "$MAIN_E2E_PATH"
+      fi
+
+      sleep 1
+      echo "Process cleanup complete"
+    depends_on: [e2e-test-main, e2e-test-feature]
+    trigger_rule: all_done
+
+  - id: final-report
+    command: archon-validate-pr-report
+    depends_on: [agg-main, agg-feature, e2e-test-main, e2e-test-feature, classify-testability, cleanup-processes]
+    trigger_rule: all_done
+    context: fresh
+    provider: pi
+    model: minimax/MiniMax-M3

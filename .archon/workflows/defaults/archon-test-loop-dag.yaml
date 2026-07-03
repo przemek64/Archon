@@ -5,6 +5,8 @@ description: |
   NOT for: General testing questions or debugging.
   Does: Initializes a counter, iterates until it reaches 3, then reports completion.
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   - id: setup
     bash: |

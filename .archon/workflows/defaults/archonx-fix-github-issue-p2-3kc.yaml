@@ -219,6 +219,16 @@ nodes:
         evaluator — a DIFFERENT model — who will actively try to break it against every
         contract criterion.
 
+        ### Solve the problem — never weaken it to pass
+        Do not edit, delete, weaken, or reinterpret the contract criteria,
+        acceptance tests, or assertions in order to get a passing/green result.
+        Implement the fix as specified. If a criterion seems wrong, impossible, or
+        contradictory: say so explicitly in `implementation.md` and stop — do NOT
+        silently change it or redefine success. A separate evaluator model reviews
+        your work and detects requirement-tampering; cheating does not get us closer
+        to done — it burns a round, pollutes context, and makes the task harder. When
+        stuck, surface the blocker instead of lowering the bar.
+
         **If this is a RETRY (retry > 0):** read the most recent
         `$ARTIFACTS_DIR/feedback/round-{retry-1}.json` and address EVERY failed
         criterion. If scores were 5-6 and rising, refine; if 1-4 or fundamentally

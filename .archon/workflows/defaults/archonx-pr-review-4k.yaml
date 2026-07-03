@@ -1,0 +1,119 @@
+name: archonx-pr-review-4k
+description: |
+  Use when: User wants the SAME review surface as the embedded "-4g" fix-pipeline review
+  (5-agent comprehensive fan-out on Kimi), run standalone against an existing PR, READ-ONLY
+  (reports findings, does NOT modify the PR). Built for review-surface A/B comparison on a
+  fixed diff (vs -4k / m3-m3) so the diff isn't mutated between reviewers.
+  Triggers: "review this PR with 4k", "kimi comprehensive review", "4k review #123".
+  NOT for: applying fixes (use the full fix pipeline), quick questions, CI status.
+
+  Mirrors the embedded review of archonx-fix-github-issue-*-4k: scope -> sync ->
+  review-classify gate -> code-review (always) + error-handling/test-coverage/
+  comment-quality/docs-impact (gated by classify) -> synthesize. Same shared command
+  files as the embedded nodes; only difference vs embedded is it STOPS at synthesize
+  (no self-fix/simplify) to stay read-only. Agents + synthesize run on pi/kimi-coding/kimi-for-coding.
+
+provider: pi
+model: minimax/MiniMax-M2.7
+nodes:
+  - id: scope
+    command: archon-pr-review-scope
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [scope]
+
+  # Classify gate — faithful to the embedded -4k review. Decides which of the 4
+  # optional agents run (code-review is always mandatory). Runs on the trivial
+  # default model (M2.7), as in the embedded workflow.
+  - id: review-classify
+    prompt: |
+      You are a PR review classifier. Analyze the PR scope and determine
+      which review agents should run.
+
+      ## PR Scope
+
+      $scope.output
+
+      ## Rules
+
+      - **Code review**: ALWAYS run. This is mandatory for every PR. It also checks
+        the PR against CLAUDE.md rules and project conventions.
+      - **Error handling**: Run if the diff touches code with try/catch, error handling,
+        async/await, or adds new failure paths.
+      - **Test coverage**: Run if the diff touches source code (not just tests, docs, or config).
+      - **Comment quality**: Run if the diff adds or modifies comments, docstrings, JSDoc,
+        or significant documentation within code files.
+      - **Docs impact**: Run if the diff adds/removes/renames public APIs, commands, CLI flags,
+        environment variables, or user-facing features.
+
+      Provide your reasoning for each decision.
+    depends_on: [sync]
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review:     { type: string, enum: ["true", "false"] }
+        run_error_handling:  { type: string, enum: ["true", "false"] }
+        run_test_coverage:   { type: string, enum: ["true", "false"] }
+        run_comment_quality: { type: string, enum: ["true", "false"] }
+        run_docs_impact:     { type: string, enum: ["true", "false"] }
+        reasoning:           { type: string }
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - reasoning
+
+  # Code review always runs — mandatory
+  - id: code-review
+    command: archon-code-review-agent
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  # Consolidate findings. READ-ONLY: workflow stops here (no self-fix/simplify),
+  # so the reviewed PR diff is left untouched for parallel reviewer comparison.
+  - id: synthesize
+    command: archon-synthesize-review
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh

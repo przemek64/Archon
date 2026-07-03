@@ -183,14 +183,20 @@ nodes:
         ```bash
         echo "REQ" >> "$ARTIFACTS_DIR/req/reviewed.txt"
         ```
-        Then STOP your turn. Do NOT emit any completion phrase — until_bash (the real queue:
-        reviewed >= total) ends the loop. The model can never declare the review done early.
+        Then STOP your turn. Do NOT emit any completion phrase — a deterministic queue check
+        (until_bash below) ends the loop ONLY when reviewed.txt covers every requirement. This is
+        why the model can never declare the review "done" early: coverage is bash-authoritative.
+      # `until` is set to a sentinel the prompt NEVER emits, so the model's self-declaration can no
+      # longer stop the loop (the old `until: REQS_DONE` let M3 quit at 18/28 — completionDetected =
+      # signalDetected || bashComplete, so a premature REQS_DONE ended it). Now ONLY until_bash (the
+      # real queue: reviewed >= total) stops it. A non-zero until_bash = "not done, keep going".
       until: __LOOP_ENDS_VIA_UNTIL_BASH_ONLY__
       max_iterations: 60
       fresh_context: true
       until_bash: |
-        total=$( { grep -c . "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$ARTIFACTS_DIR/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ── Resilience: resume if the loop died mid-queue (silent provider stream close is not retried) ──
@@ -229,14 +235,15 @@ nodes:
         ```bash
         echo "REQ" >> "$ARTIFACTS_DIR/req/reviewed.txt"
         ```
-        Then STOP your turn. Do NOT emit any completion phrase — until_bash ends the loop only
-        when reviewed.txt covers every requirement.
+        Then STOP your turn. Do NOT emit any completion phrase — until_bash ends the loop only when
+        reviewed.txt covers every requirement.
       until: __LOOP_ENDS_VIA_UNTIL_BASH_ONLY__
       max_iterations: 60
       fresh_context: true
       until_bash: |
-        total=$( { grep -c . "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$ARTIFACTS_DIR/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ═══════════════════════════════════════════════════════════════
@@ -263,8 +270,87 @@ nodes:
         (or its absence), in severity order.
       Keep it concise and falsifiable. Output a one-line confirmation only.
 
-  - id: post-report
+  # ── Structured verdict (MECHANICAL — no LLM): parse the per-requirement R*.md files
+  #    into a gf-verdict/1 JSON block. The p6 merge-gate reads THIS, not the prose. ──
+  - id: emit-verdict
     depends_on: [aggregate]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      "$PY" - << 'PYEOF'
+      import json, os, re, glob
+      A = os.environ["ARTIFACTS_DIR"]
+      def readf(p, d=""):
+          try:
+              return open(os.path.join(A, p), encoding="utf-8").read().strip()
+          except OSError:
+              return d
+      pr    = readf(".pr-number")
+      issue = readf(".issue-number")
+      base  = readf(".pr-base")
+      head  = readf(".pr-head-sha")
+      def count_lines(p):
+          try:
+              return sum(1 for l in open(os.path.join(A, p), encoding="utf-8") if l.strip())
+          except OSError:
+              return 0
+      def count_unique(p):
+          try:
+              return len({l.strip() for l in open(os.path.join(A, p), encoding="utf-8") if l.strip()})
+          except OSError:
+              return 0
+      total    = count_lines("req/requirements.txt")
+      # reviewed is computed BELOW as the count of per-requirement analysis files actually
+      # WRITTEN (R*.md) — NOT reviewed.txt lines. A model can echo reviewed.txt without doing
+      # the work (GLM did exactly that: 19 "reviewed" but 1 R-file -> hollow spec-faithful).
+      # Counting real artifacts makes reviewed_all un-fakeable.
+      findings = []
+      for f in sorted(glob.glob(os.path.join(A, "req", "R*.md"))):
+          txt = open(f, encoding="utf-8").read()
+          rid = os.path.splitext(os.path.basename(f))[0]
+          m = re.search(r'^#\s*(.+)$', txt, re.M)
+          title = (m.group(1).strip() if m else rid)
+          ms = re.search(r'\*\*Status\*\*:\s*([A-Za-z]+)', txt)
+          status = (ms.group(1).strip().capitalize() if ms else "Unknown")
+          mv = re.search(r'\*\*Severity\*\*:\s*([A-Za-z/]+)', txt)
+          sev = (mv.group(1).strip().upper() if mv else "N/A")
+          findings.append({"req": rid, "status": status, "severity": sev, "text": title})
+      reviewed = len(findings)   # AUTHORITATIVE: count of R*.md artifacts actually produced
+      def sev_in(f, s): return f["severity"] in s
+      counts = {"total": total, "reviewed": reviewed,
+                "met":  sum(1 for f in findings if f["status"] == "Met"),
+                "gap":  sum(1 for f in findings if f["status"] == "Gap"),
+                "stub": sum(1 for f in findings if f["status"] == "Stub"),
+                "risk": sum(1 for f in findings if f["status"] == "Risk")}
+      by_sev = {s: sum(1 for f in findings if f["severity"] == s)
+                for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
+      gaprisk   = [f for f in findings if f["status"] in ("Gap", "Risk")]
+      blocking  = [f for f in gaprisk if sev_in(f, ("CRITICAL", "HIGH"))]
+      deferrable= [f for f in gaprisk if sev_in(f, ("MEDIUM", "LOW"))]
+      stubs     = [f for f in findings if f["status"] == "Stub"]
+      reviewed_all = total > 0 and reviewed >= total
+      verdict = "spec-faithful"
+      if any(f["status"] == "Gap" and sev_in(f, ("CRITICAL", "HIGH")) for f in findings):
+          verdict = "gaps-found"
+      elif gaprisk:
+          verdict = "faithful-with-risk"
+      out = {"schema": "gf-verdict/1", "stage": "p5",
+             "pr": int(pr) if pr.isdigit() else pr,
+             "issue": int(issue) if issue.isdigit() else issue,
+             "head_sha": head, "base": base,
+             "counts": counts, "by_severity": by_sev,
+             "reviewed_all": reviewed_all,
+             "blocking": blocking, "deferrable": deferrable, "stubs": stubs,
+             "verdict": verdict}
+      open(os.path.join(A, "verdict.json"), "w", encoding="utf-8").write(json.dumps(out, indent=2))
+      print(f"verdict: {verdict} reviewed={reviewed}/{total} blocking={len(blocking)} deferrable={len(deferrable)}")
+      PYEOF
+
+  - id: post-report
+    depends_on: [emit-verdict]
     trigger_rule: all_done
     bash: |
       export PATH="$PATH:/home/user/.local/bin"
@@ -272,6 +358,15 @@ nodes:
       PR=$(cat "$ARTIFACTS_DIR/.pr-number")
       BODY="$ARTIFACTS_DIR/spec-review.md"
       if [ -s "$BODY" ]; then
+        # gf-stage marker: lets the grey-factory orchestrator detect THIS stage's artifact
+        # (the p5 spec-review, posted as a PR review body) as done.
+        printf '\n\n<!-- gf-stage:p5 -->\n' >> "$BODY"
+        # gf-verdict block (machine-readable; HTML comment so it never renders) — p6 reads this.
+        if [ -s "$ARTIFACTS_DIR/verdict.json" ]; then
+          printf '<!-- gf-verdict:p5\n' >> "$BODY"
+          cat "$ARTIFACTS_DIR/verdict.json" >> "$BODY"
+          printf '\n-->\n' >> "$BODY"
+        fi
         # Map the report verdict -> GitHub PR review STATE (post into the PR review thread).
         #   spec-faithful -> APPROVE   gaps-found -> REQUEST_CHANGES   else -> COMMENT
         # Priority order matters ('faithful-with-risk' contains 'faithful').

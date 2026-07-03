@@ -1,0 +1,120 @@
+name: archonx-negotiate-adversarial-glm-m3
+description: |
+  Standalone ADVERSARIAL criteria-negotiation (CROSS-MODEL: glm proposer, m3 adversary).
+  Proposer glm drafts the acceptance contract from a GitHub issue; an m3 (MiniMax-M3)
+  mind (fresh context, adversarial framing) hunts the proposal's MISSING
+  deliverables / happy-path holes / comment-trusting criteria / single-file
+  coverage gaps, then emits the merged final contract. Tests whether a DIFFERENT
+  MODEL as adversary produces a more complete contract than same-model cross-mind.
+  Issue number from ARGUMENTS (default 70). Trigger: "run archonx-negotiate-adversarial-glm-m3".
+
+provider: pi
+model: zai/glm-5.2
+nodes:
+  - id: fetch-issue
+    timeout: 60000
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/contracts"
+      N=$(echo "${ARGUMENTS:-}" | grep -oE '#[0-9]+' | tail -1 | tr -d '#')
+      [ -z "$N" ] && N=$(echo "${ARGUMENTS:-}" | grep -oE '(^|[^A-Za-z0-9])[0-9]+' | tail -1 | grep -oE '[0-9]+')
+      [ -z "$N" ] && N=70
+      echo "$N" > "$ARTIFACTS_DIR/.issue-number"
+      gh issue view "$N" --json number,title,body \
+        -q '"#"+(.number|tostring)+" "+.title+"\n\n"+.body' \
+        > "$ARTIFACTS_DIR/issue.md"
+      echo "fetched issue #$N ($(wc -l < "$ARTIFACTS_DIR/issue.md") lines)"
+
+  # PASS 1 — Proposer (glm): extract a first-draft contract from the issue.
+  - id: propose
+    provider: pi
+    model: zai/glm-5.2
+    depends_on: [fetch-issue]
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Bash]
+    prompt: |
+      You are the PROPOSER. Draft the acceptance CONTRACT for fixing this issue.
+      The contract is what an adversarial evaluator will later score the
+      implementation against, so it must be concrete, testable, and faithful to
+      the issue — NOT to whatever an implementer happens to build.
+
+      Read `$ARTIFACTS_DIR/issue.md` (AUTHORITATIVE spec). You MAY read repo files
+      to ground your `verify` steps.
+
+      Extract EVERY requirement: positive requirements (what must happen),
+      constraints (what must NOT happen / must stay unchanged), and edge cases —
+      each as its own first-class criterion. Propose 5-15. Each must be concrete
+      and verifiable (a command to run / output to inspect / file to read), never
+      "works correctly".
+
+      Write `$ARTIFACTS_DIR/contracts/proposed.json` with the Write tool:
+      ```json
+      { "issue": "<number>",
+        "criteria": [ { "name": "kebab", "description": "...", "verify": "...", "threshold": 7 } ] }
+      ```
+      Return the same JSON as structured output.
+
+  # PASS 2 — Adversary (m3 / MiniMax-M3, a DIFFERENT MODEL, fresh context): audit + merge.
+  - id: adversary-merge
+    provider: pi
+    model: minimax/MiniMax-M3
+    depends_on: [propose]
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Bash]
+    prompt: |
+      You are the CRITERIA ADVERSARY — a DIFFERENT mind than the proposer. Your
+      job is to find what the proposed contract MISSES, then emit the final
+      merged contract. A shallow, incomplete contract is how a PR silently drops
+      part of the spec — your mandate is to close every hole.
+
+      Read:
+      - `$ARTIFACTS_DIR/issue.md` — the AUTHORITATIVE spec.
+      - `$ARTIFACTS_DIR/contracts/proposed.json` — the proposer's draft (your target).
+      You MAY read repo files to ground checks.
+
+      ## Audit the draft against the issue (do ALL):
+      1. MISSING DELIVERABLES — every deliverable / constraint / "How to test"
+         bullet in the issue that has NO matching criterion. Add one for each.
+      2. WHOLE-SCOPE COVERAGE — for anything that must hold across MULTIPLE files
+         (a renamed/removed constant, a hardcoded value, a port), the `verify`
+         must check the ENTIRE affected directory, not just the headline file:
+         require the new token present AND the old/forbidden token absent
+         (e.g. `! git grep -n 'ttymxc4' -- bridge/ && git grep -q 'ttymxc0' -- bridge/`).
+      3. ANTI-THEATER — a criterion is satisfied only by CODE or observable
+         behavior, NEVER by a comment/docstring/PR text claiming it. Where a
+         behavior is required, `verify` must locate the actual call in source
+         (e.g. `git grep -n 'chmod' -- bridge/tty_bridge.py`), not a sentence.
+      4. HAPPY-PATH HOLES — reject any criterion a shallow one-file edit could
+         pass while leaving the rest of the scope stale; tighten it.
+
+      ## GUARDRAIL (do NOT gold-plate)
+      Add ONLY criteria grounded in the issue text. Do not invent requirements the
+      issue never states — that causes false rejections downstream.
+
+      ## Output
+      Write the FINAL merged contract to `$ARTIFACTS_DIR/contracts/impl.json`
+      (union of upheld proposed criteria + your additions, deduplicated, tightened):
+      ```json
+      { "issue": "<number>",
+        "criteria": [ { "name": "kebab", "description": "...", "verify": "...", "threshold": 7,
+                        "source": "proposed|adversary" } ] }
+      ```
+      Also write `$ARTIFACTS_DIR/contracts/audit-notes.md`: which proposed criteria
+      you UPHELD/TIGHTENED/DROPPED and every criterion you ADDED with why.
+      Return the final contract JSON as structured output.
+
+  - id: report
+    depends_on: [adversary-merge]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      set -uo pipefail
+      cd "$ARTIFACTS_DIR/contracts"
+      p=$(grep -oE '"name"' proposed.json 2>/dev/null | wc -l | tr -d ' ')
+      f=$(grep -oE '"name"' impl.json 2>/dev/null | wc -l | tr -d ' ')
+      a=$(grep -oE '"source"\s*:\s*"adversary"' impl.json 2>/dev/null | wc -l | tr -d ' ')
+      echo "proposed criteria: $p"
+      echo "final criteria:    $f  (adversary-added: $a)"
+      echo "artifacts: $ARTIFACTS_DIR/contracts (proposed.json, impl.json, audit-notes.md)"

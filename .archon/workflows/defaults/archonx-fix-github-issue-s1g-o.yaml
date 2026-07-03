@@ -169,6 +169,14 @@ nodes:
     prompt: |
       You integrate any MISSING-requirement findings into the contract. BOUNDED: one round.
 
+      ### Close each gap for real — never with a toothless criterion
+      When you ADD a criterion for an uncovered requirement, its `verify` must actually
+      FAIL a violating implementation. Do not "close" a gap by adding a vague or always-
+      passing check, and do not weaken or reword existing criteria to make the audit
+      look satisfied — PRESERVE existing criteria verbatim as instructed. A separate
+      coverage-recheck adversary re-audits after you and will push back on gaps papered
+      over this way, so faking coverage does not get us closer to done.
+
       Read:
       - `$ARTIFACTS_DIR/contracts/impl.json` — the current contract.
       - `$ARTIFACTS_DIR/contracts/coverage-audit.md` — uncovered requirements (may be empty).

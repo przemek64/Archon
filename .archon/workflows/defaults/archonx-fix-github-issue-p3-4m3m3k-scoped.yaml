@@ -446,16 +446,68 @@ nodes:
       export PATH="$PATH:/home/user/.local/bin"
       set -uo pipefail
       PR=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
-      FILES="$ARTIFACTS_DIR/review/files.txt"; REVIEWED="$ARTIFACTS_DIR/review/reviewed.txt"
+      FILES="$ARTIFACTS_DIR/review/files.txt"
       total=$( { [ -f "$FILES" ] && grep -c . "$FILES"; } 2>/dev/null | tail -1 ); total=${total:-0}
-      reviewed=$( { [ -f "$REVIEWED" ] && sort -u "$REVIEWED" | grep -c .; } 2>/dev/null | tail -1 ); reviewed=${reviewed:-0}
+      # AUTHORITATIVE: count the REAL per-file review artifacts (review/deep/*.md), NOT
+      # reviewed.txt lines — a model can echo reviewed.txt without writing the analysis
+      # (GLM did this in p5), faking coverage. Counting artifacts makes it un-fakeable.
+      reviewed=$( ls "$ARTIFACTS_DIR/review/deep"/*.md 2>/dev/null | grep -c . | tail -1 ); reviewed=${reviewed:-0}
       if [ -z "$PR" ] || [ "$total" -eq 0 ] || [ "$reviewed" -lt "$total" ]; then
         echo "verdict-marker: REFUSING to mark p3 done — review did not complete (PR=${PR:-?}, reviewed=$reviewed/$total)." >&2
         echo "verdict-marker: enumerate-files/sync-guard likely failed -> nothing was reviewed. No gf-stage:p3 marker posted." >&2
         exit 1
       fi
-      gh pr comment "$PR" --body "$(printf 'M3.M3 review complete — %s file(s) reviewed.\n\n<!-- gf-stage:p3 -->\n' "$total")"
-      echo "verdict-marker: posted gf-stage:p3 marker for PR #$PR ($reviewed/$total files reviewed)."
+      # ── MECHANICAL gf-verdict:p3 block (best-effort; NEVER fails the run) ──
+      #   The grey-factory p3 auto-judge (gate_judge.parse_verdict) needs a machine-readable
+      #   `<!-- gf-verdict:p3 {json} -->` block; without it every p3 verdict reads as
+      #   structured=False and the fence ESCALATEs forever (Opus tier unreachable). Mirror p5:
+      #   derive severity counts + verdict from the post-audit consolidated review, and compute
+      #   reviewed_all un-fakeably from the real deep/*.md artifacts (restores truncation detection).
+      ISSUE=$(cat "$ARTIFACTS_DIR/.issue-number" 2>/dev/null | tr -d ' \n')
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      "$PY" - "$PR" "${ISSUE:-}" "$total" "$reviewed" << 'PYEOF' || true
+      import json, os, re, sys
+      A = os.environ["ARTIFACTS_DIR"]
+      pr, issue, total, reviewed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+      def read(p):
+          try: return open(os.path.join(A, p), encoding="utf-8").read()
+          except OSError: return ""
+      txt = read("review/consolidated-review.md") or read("review/final-summary.md")
+      def sev(name):
+          # severity-count table row `| CRITICAL | 3 |`, else prose `3 CRITICAL`
+          m = re.search(r"\|\s*%s\s*\|\s*(\d+)" % name, txt, re.I) or re.search(r"(\d+)\s+%s\b" % name, txt, re.I)
+          return int(m.group(1)) if m else 0
+      by = {s: sev(s) for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
+      mv = re.search(r"Verdict[:*\s]+(APPROVE|REQUEST[_ ]CHANGES|NEEDS[_ ]DISCUSSION)", txt, re.I)
+      verdict = mv.group(1).upper().replace(" ", "_") if mv else "UNKNOWN"
+      out = {"schema": "gf-verdict/1", "stage": "p3",
+             "pr": int(pr) if pr.isdigit() else pr,
+             "issue": int(issue) if issue.isdigit() else issue,
+             "by_severity": by,
+             "reviewed_all": total > 0 and reviewed >= total,
+             "reviewed": reviewed, "total": total, "verdict": verdict}
+      open(os.path.join(A, "p3-verdict.json"), "w", encoding="utf-8").write(json.dumps(out, indent=2))
+      print("verdict-marker: gf-verdict:p3 %s crit=%d high=%d reviewed=%d/%d"
+            % (verdict, by["CRITICAL"], by["HIGH"], reviewed, total))
+      PYEOF
+      # Build ONE final comment: the post-audit review prose (so the auto-judge's Opus tier
+      # keeps full context) + the gf-stage marker + the machine block. Fall back gracefully.
+      BODY="$ARTIFACTS_DIR/review/marker-comment.md"
+      if [ -s "$ARTIFACTS_DIR/review/consolidated-review.md" ]; then
+        cat "$ARTIFACTS_DIR/review/consolidated-review.md" > "$BODY"; printf '\n\n' >> "$BODY"
+      elif [ -s "$ARTIFACTS_DIR/review/final-summary.md" ]; then
+        cat "$ARTIFACTS_DIR/review/final-summary.md" > "$BODY"; printf '\n\n' >> "$BODY"
+      else
+        printf 'M3.M3 review complete — %s file(s) reviewed.\n\n' "$total" > "$BODY"
+      fi
+      printf '<!-- gf-stage:p3 -->\n' >> "$BODY"
+      if [ -s "$ARTIFACTS_DIR/p3-verdict.json" ]; then
+        printf '<!-- gf-verdict:p3\n' >> "$BODY"
+        cat "$ARTIFACTS_DIR/p3-verdict.json" >> "$BODY"
+        printf '\n-->\n' >> "$BODY"
+      fi
+      gh pr comment "$PR" --body-file "$BODY"
+      echo "verdict-marker: posted gf-stage:p3 (+gf-verdict:p3 if derived) for PR #$PR ($reviewed/$total files reviewed)."
 
   - id: human-gate
     approval:

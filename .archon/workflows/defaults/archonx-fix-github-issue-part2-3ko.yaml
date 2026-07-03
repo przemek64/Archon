@@ -1,0 +1,370 @@
+name: archonx-fix-github-issue-part2-3ko
+description: |
+  PART 2 of 3 of the split fix-issue chain (see part1 for the full design). This part
+  BOOTSTRAPS from the frozen plan+contract part1 committed to the shared branch
+  archon/fix-issue-<N>-opus, runs the cross-model adversarial IMPLEMENT loop (glm generator
+  / codex evaluator), validates, runs the repo project gate, and opens a DRAFT PR.
+  part3 then reviews that PR.
+  Triggers: "fix issue part2 #123", "implement #123", "build the frozen contract #123".
+  NOT for: planning (run part1 first), reviewing (part3), one-shot fixes (the monolith).
+
+  ── HANDOFF (local-only, deterministic branch) ────────────────────────────────
+  Must run in the SAME git checkout as part1. The `bootstrap` node checks out the
+  local shared branch archon/fix-issue-<N>-opus (part1 created the ref but did NOT check
+  it out, so it is free here) and restores the frozen artifacts into $ARTIFACTS_DIR:
+    - .archon-run/issue-<N>/contracts/impl.json -> $ARTIFACTS_DIR/contracts/impl.json (AUTHORITATIVE)
+    - .archon-run/issue-<N>/plan.md             -> $ARTIFACTS_DIR/investigation.md
+    - .archon-run/issue-<N>/base-branch         -> resolved PR base (parts agree)
+  create-pr pushes the shared branch and opens the PR, so part3 finds it via
+  `gh pr list --head archon/fix-issue-<N>-opus`.
+
+  Model routing:
+    - adversarial-implement GENERATOR (building)   -> pi/kimi-coding/kimi-for-coding
+    - adversarial-implement EVALUATOR (evaluating) -> claude/opus (different mind)
+    - everything else trivial                      -> pi/MiniMax-M2.7
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: RESOLVE ISSUE + BOOTSTRAP FROM THE FROZEN SHARED BRANCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If ambiguous, use `gh issue list` to search for matching issues and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example: 709
+
+  - id: fetch-issue
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then echo "Failed to extract issue number from: $extract-issue-number.output" >&2; exit 1; fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below and determine its type.
+
+      ## Issue Content
+
+      $fetch-issue.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | "add", "new", "support", "would be nice", net-new capability |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-issue]
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # Check out the shared branch part1 created (LOCAL ref, not pushed) and restore the
+  # frozen plan+contract into $ARTIFACTS_DIR. All implementation commits land here.
+  - id: bootstrap
+    depends_on: [extract-issue-number]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "bootstrap: could not resolve issue number" >&2; exit 1; }
+      BR="archon/fix-issue-$N-opus"
+      REF="refs/archon-run/issue-$N-opus"
+      HSRC=".archon-run/issue-$N"
+      git worktree prune 2>/dev/null || true
+      git fetch origin --quiet 2>/dev/null || true
+      # The handoff lives in the side ref refs/archon-run/issue-<N>-opus (part1 stored it
+      # OUT of the branch so it never reaches the PR diff). Require it.
+      git rev-parse --verify "$REF" >/dev/null 2>&1 || {
+        echo "bootstrap: handoff ref $REF not found — run part1 in THIS git checkout first" >&2
+        echo "(local-only handoff — the ref is not pushed)." >&2
+        exit 1
+      }
+      # Land THIS worktree on the shared work branch (clean base tip part1 created,
+      # NOT checked out, so it is free). Implementation commits land on top of it.
+      if ! git checkout -B "$BR" "$BR" 2>/dev/null; then
+        git checkout "$BR" 2>/dev/null || {
+          echo "bootstrap: cannot check out work branch $BR" >&2; exit 1; }
+      fi
+      # Restore plan + contract from the side ref into $ARTIFACTS_DIR (NOT into the work tree).
+      # NOTE: `git show <ref>:<path>` carries a colon; under Git Bash on Windows, MSYS arg
+      # conversion mangles "refs/...:.archon-run/..." into "refs\...;.archon-run\..." and the
+      # read fails. Disable path conversion for these calls (no-op on Linux/WSL).
+      mkdir -p "$ARTIFACTS_DIR/contracts"
+      MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git show "$REF:$HSRC/contracts/impl.json" > "$ARTIFACTS_DIR/contracts/impl.json"
+      MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git show "$REF:$HSRC/plan.md"             > "$ARTIFACTS_DIR/investigation.md"
+      [ -s "$ARTIFACTS_DIR/contracts/impl.json" ] || { echo "bootstrap: restored impl.json is empty" >&2; exit 1; }
+      BASE=$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git show "$REF:$HSRC/base-branch" 2>/dev/null | tr -d ' \n'); [ -n "$BASE" ] || BASE=main
+      printf '%s' "$BASE" > "$ARTIFACTS_DIR/.base-branch"
+      echo "$N" > "$ARTIFACTS_DIR/.issue-number"
+      git fetch origin "$BASE" --quiet 2>/dev/null || true
+      echo "part2 bootstrap: on $BR @ $(git rev-parse --short HEAD), base=$BASE, contract+plan restored from $REF"
+
+  # Echo the resolved base for downstream nodes that reference $resolve-base-branch.output
+  # (project-gate diff scope, create-pr --base). Same node id as the monolith so the
+  # reused create-pr / project-gate node bodies need no edits.
+  - id: resolve-base-branch
+    depends_on: [bootstrap]
+    timeout: 30000
+    bash: |
+      printf '%s' "$(cat "$ARTIFACTS_DIR/.base-branch" 2>/dev/null | tr -d ' \n')"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: ADVERSARIAL IMPLEMENT (cross-model "different mind")
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: init-impl-state
+    depends_on: [bootstrap]
+    bash: |
+      mkdir -p "$ARTIFACTS_DIR/feedback"
+      cat > "$ARTIFACTS_DIR/impl-state.json" << 'STATEEOF'
+      {
+        "phase": "building",
+        "retry": 0,
+        "maxRetries": 3,
+        "passThreshold": 7,
+        "status": "running"
+      }
+      STATEEOF
+      echo "impl-state.json seeded"
+    timeout: 30000
+
+  - id: adversarial-implement
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [init-impl-state]
+    idle_timeout: 600000
+    loop:
+      roleModels:
+        stateFile: $ARTIFACTS_DIR/impl-state.json
+        field: phase
+        map:
+          building:   { provider: pi,    model: kimi-coding/kimi-for-coding }
+          evaluating: { provider: claude, model: opus }
+        default:      { provider: pi,    model: kimi-coding/kimi-for-coding }
+      prompt: |
+        # Adversarial Implementation — Generator ↔ Evaluator (cross-model)
+
+        You play ONE role this iteration, determined by `phase` in the state file.
+        The generator and evaluator run on DIFFERENT models — you are whichever role
+        `phase` says, and your adversary is a different mind. The "app" is the REAL
+        repository worktree you are running in (current directory) — NOT a throwaway
+        sandbox. Changes you commit land on the issue branch and become the PR.
+
+        ## FIRST: Read State
+        Read `$ARTIFACTS_DIR/impl-state.json`:
+        - `phase` — "building" (Generator) or "evaluating" (Evaluator)
+        - `retry` — current retry attempt (0 = first try)
+        - `maxRetries` — max retries before giving up (default 3)
+        - `passThreshold` — minimum score to pass (default 7)
+
+        Then read:
+        - `$ARTIFACTS_DIR/contracts/impl.json` — the acceptance contract (authoritative)
+        - `$ARTIFACTS_DIR/investigation.md` — investigation / plan (the approach)
+
+        ---
+
+        ## ROLE: GENERATOR (phase = "building")
+
+        You are a software engineer implementing the fix so it SURVIVES an adversarial
+        evaluator — a DIFFERENT model — who will actively try to break it against every
+        contract criterion.
+
+        **If this is a RETRY (retry > 0):** read the most recent
+        `$ARTIFACTS_DIR/feedback/round-{retry-1}.json` and address EVERY failed
+        criterion. If scores were 5-6 and rising, refine; if 1-4 or fundamentally
+        wrong, pivot.
+
+        **Build rules:**
+        - Follow the investigation/plan, but the CONTRACT wins on conflicts.
+        - Honor the repo's conventions and any CLAUDE.md rules.
+        - Satisfy EVERY criterion in the contract — including constraints and edge
+          cases, not just the happy path. The evaluator will check all of them.
+        - Run the code yourself before committing. Verify each criterion's `verify`
+          step actually passes for you.
+        - Stage ONLY the files you edited — never `git add -A`/`.`/`-u`. Then commit:
+          `git add <file1> <file2> ... && git commit -m "fix: <what changed> (#<issue>)"`
+        - Do NOT stage anything under `$ARTIFACTS_DIR`, `.archon-run/`, `*.scratch.md`, `*-report.md`.
+
+        **Write/refresh** `$ARTIFACTS_DIR/implementation.md` — files changed, tasks
+        done, how each contract criterion is satisfied, any deviations. (Downstream
+        PR creation reads this file, so it must always exist after you run.)
+
+        **Update impl-state.json:** set `"phase": "evaluating"`. Keep other fields.
+
+        ---
+
+        ## ROLE: EVALUATOR (phase = "evaluating")
+
+        You are an ADVERSARIAL QA agent, and a DIFFERENT model than the one that built
+        this. Your mandate is to BREAK the implementation. You are not helpful, not
+        generous — you are an attacker, and you do not share the builder's assumptions.
+
+        **CRITICAL CONSTRAINTS:**
+        - READ-ONLY on source. NEVER use Write/Edit on repository source files. (You
+          MAY write only to `$ARTIFACTS_DIR/feedback/`.)
+        - You MAY use Bash to run the app, run the test suite, diff outputs, probe edge
+          cases. Kill any background process you start before finishing.
+        - Score EVERY criterion in `$ARTIFACTS_DIR/contracts/impl.json`. No skipping.
+
+        **Scoring:** 9-10 exceptional (handles unstated edges) · 7-8 solid (meets the
+        criterion) · 5-6 partial (core works, fails edges/has bugs) · 3-4 weak · 1-2
+        broken/absent. Do NOT grade on a curve. A 7 means "genuinely meets the bar."
+
+        **For each criterion:** read the relevant source, run its `verify` step, then
+        try to break it (invalid inputs, boundary values, error paths, and the
+        golden output if one exists). Score honestly.
+
+        **Write** `$ARTIFACTS_DIR/feedback/round-{retry}.json`:
+        ```json
+        {
+          "passed": <true iff ALL scores >= passThreshold>,
+          "scores": { "criterion-name": <score>, ... },
+          "feedback": [
+            { "criterion": "criterion-name", "score": <1-10>,
+              "details": "Specific findings: file:line, exact command run, exact output vs expected." }
+          ],
+          "overallSummary": "What works, what is broken, what the generator must fix."
+        }
+        ```
+
+        **Update impl-state.json by result:**
+        - PASSED (every score >= threshold): set `"status": "passed"`.
+        - FAILED & `retry` < `maxRetries`: set `"phase": "building"`, increment `"retry"` by 1.
+        - FAILED & `retry` >= `maxRetries`: set `"status": "exhausted"`.
+
+        Kill any background processes before finishing.
+
+        ---
+
+        ## COMPLETION
+        After updating impl-state.json, check `status`:
+        - `"passed"`    → Output: `<promise>IMPL_DONE</promise>`
+        - `"exhausted"` → the loop gave up; the latest implementation + feedback stand
+                          (downstream review/self-fix will still run). Output: `<promise>IMPL_DONE</promise>`
+        - `"running"`   → more work to do. Do NOT output any completion signal.
+
+      until: IMPL_DONE
+      max_iterations: 16
+      fresh_context: true
+      until_bash: |
+        grep -qE '"status"\s*:\s*"(passed|exhausted)"' "$ARTIFACTS_DIR/impl-state.json"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [adversarial-implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2b: PROJECT GATE (data-driven — reads .archon/gates.json)
+  # ═══════════════════════════════════════════════════════════════
+  - id: project-gate
+    depends_on: [validate, resolve-base-branch]
+    bash: |
+      set -uo pipefail
+      [ -f .archon/gates.json ] || { echo "No .archon/gates.json — skipping project gate."; exit 0; }
+      BASE=$resolve-base-branch.output
+      echo "Project gate base: $BASE"
+      CHANGED=$(git diff --name-only "$BASE...HEAD")
+      echo "Changed files:"; echo "$CHANGED" | sed 's/^/  /'
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      "$PY" - "$CHANGED" << 'PYEOF'
+      import json, sys, subprocess, fnmatch, os
+      changed = [l for l in sys.argv[1].splitlines() if l.strip()]
+      gates = json.load(open(".archon/gates.json"))["gates"]
+      def hit(p):
+          if p in ("*", "**"): return True
+          if "/" not in p: return any(fnmatch.fnmatch(os.path.basename(f), p) for f in changed)
+          return any(fnmatch.fnmatch(f, p) for f in changed)
+      failed = []
+      for g in gates:
+          if not any(hit(p) for p in g.get("when_paths", ["*"])):
+              print(f"[skip] {g['name']} (no matching changed paths)"); continue
+          print(f"[run ] {g['name']}: {g['run']}")
+          rc = subprocess.run(g["run"], shell=True).returncode
+          print(f"[{'pass' if rc == 0 else 'FAIL'}] {g['name']} (exit {rc})")
+          if rc != 0: failed.append(g["name"])
+      if failed:
+          print("PROJECT GATE FAILED:", ", ".join(failed)); sys.exit(1)
+      print("PROJECT GATE PASSED")
+      PYEOF
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: CREATE DRAFT PR (pushes the shared branch — part3 finds it here)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request for the current branch.
+
+      ## Context
+
+      - **Issue**: $ARGUMENTS
+      - **Classification**: $classify.output
+      - **Issue title**: $classify.output.title
+
+      ## Instructions
+
+      1. Clean up runtime-generated files, then commit ONLY the implementation's own changes:
+         - Archon may sync its bundled default workflows into this worktree. Discard them so they never reach the PR:
+           `git checkout -- .archon/ 2>/dev/null; git clean -fd .archon/ 2>/dev/null`
+         - The handoff (plan/contract) lives in the side ref refs/archon-run/issue-<N>-opus, NOT in the work tree, so there is nothing to exclude there — but if a `.archon-run/` dir ever appears, never stage it.
+         - Run `git status`. The adversarial loop already committed the fix. If — and only if — source files the
+           implementation actually edited remain uncommitted, stage those specific files BY PATH and commit them.
+           NEVER use `git add -A` / `git add .` / `git add -u`, and never stage anything under `.archon/`,
+           `.archon-run/`, `$ARTIFACTS_DIR`, `*.scratch.md`, or `*-report.md`.
+      2. Push the branch: `git push -u origin HEAD`
+      3. Read implementation artifacts from `$ARTIFACTS_DIR/` for context:
+         - `$ARTIFACTS_DIR/investigation.md`
+         - `$ARTIFACTS_DIR/implementation.md`
+         - `$ARTIFACTS_DIR/contracts/impl.json` (acceptance contract) and the latest `$ARTIFACTS_DIR/feedback/round-*.json` (adversarial verdict)
+         - `$ARTIFACTS_DIR/validation.md`
+      4. Check if a PR already exists for this branch: `gh pr list --head $(git branch --show-current)`
+         - If PR exists, skip creation and capture its number
+      5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
+      6. Create a DRAFT PR: `gh pr create --draft --base $resolve-base-branch.output`
+         - Title: concise, imperative mood, under 70 chars
+         - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, validation evidence, the adversarial acceptance verdict (which criteria passed and final scores), and `Fixes #...`.
+         - PR body FIRST line MUST be the literal [Issue #<issue-number>] (e.g. for issue 72: [Issue #72]) on its own line, BEFORE any template or summary content.
+         - Link to issue: include `Fixes #...` or `Closes #...`
+      7. Capture PR identifiers:
+         ```bash
+         PR_NUMBER=$(gh pr view --json number -q '.number')
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         PR_URL=$(gh pr view --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+      8. Tell the operator the next step: `archon workflow run archonx-fix-github-issue-part3-4m3m3o <issue#>`
+    depends_on: [project-gate, resolve-base-branch, classify]
+    context: fresh

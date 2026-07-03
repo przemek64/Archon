@@ -1,0 +1,398 @@
+name: archonx-fix-github-issue-s1g-c
+description: |
+  Use when: a CANDIDATE contract has been staged by p1a and you want the s-family
+  freeze: run BOTH freeze-gates and FREEZE. This is PART 1g (the gate+freeze stage):
+    1. verify-contract-with-spec (anti-OMISSION): a codex coverage adversary checks every
+       issue requirement maps to an enforcing criterion. BOUNDED AUTO-FIX: kimi folds
+       uncovered requirements in (ONE round), the same mind re-checks, gate HARD-FAILS only
+       if gaps remain. Catches dropped constraints (e.g. #65's "no-fork / single combiner").
+    2. ground-contract (anti-FABRICATION): executes each `ground` anchor against the real
+       artifact; blocks freeze on any value that contradicts reality.
+  Coverage runs FIRST so criteria it ADDS are also reality-checked by ground-contract.
+  Bootstraps from refs/archon-run/issue-<N>-candidate[-<suffix>], freezes to
+  refs/archon-run/issue-<N>-kimi[-<suffix>] + work branch for p2-3kc.
+  Triggers: "fix issue s1g c #123", "codex coverage+ground freeze for #123".
+  NOT for: planning/negotiate (p1a first), implement (p2), review (p3).
+
+  s1g-c: the COVERAGE AUDITOR mind is codex; applier is always kimi; ground is bash.
+  Pipeline: p1a -> s1g-c -> p2-3kc -> p3-4m3m3k. Pass the SAME suffix to p1a and s1g.
+  from:<ref> (escape hatch) overrides the work-branch start point at freeze.
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If the message is ambiguous, use `gh issue list` to search for matching issues and pick the best match.
+      - IGNORE any trailing variant tokens like `v2`, `sfx:foo`, or `from:<ref>` — they are NOT the issue number.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+
+  - id: fetch-issue
+    depends_on: [extract-issue-number]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then echo "Failed to extract issue number from: $extract-issue-number.output" >&2; exit 1; fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+
+  # ════════════════════════════════════════════════════════════════
+  # BOOTSTRAP: restore the p1a candidate, repoint worktree to its base
+  #   Reads refs/archon-run/issue-<N>-candidate[-<suffix>] into $ARTIFACTS_DIR and
+  #   hard-resets the worktree to origin/<base> so the gates run against the REAL
+  #   base tree (ground anchors read fixtures; coverage greps the source).
+  # ════════════════════════════════════════════════════════════════
+
+  - id: restore-candidate
+    depends_on: [extract-issue-number]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "restore-candidate: could not resolve issue number" >&2; exit 1; }
+      SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'sfx:[A-Za-z0-9._-]+' | head -1 | sed 's/^sfx://')
+      [ -n "$SFX" ] || SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -owE 'v[0-9]+' | head -1)
+      REF="refs/archon-run/issue-$N-candidate${SFX:+-$SFX}"
+      git rev-parse --verify "$REF" >/dev/null 2>&1 || { echo "restore-candidate: $REF not found — run p1a first with the SAME suffix" >&2; exit 1; }
+      mkdir -p "$ARTIFACTS_DIR/contracts"
+      git cat-file -p "$REF:candidate/plan.md"                  > "$ARTIFACTS_DIR/investigation.md"
+      git cat-file -p "$REF:candidate/contracts/impl.json"      > "$ARTIFACTS_DIR/contracts/impl.json"
+      git cat-file -p "$REF:candidate/contracts/audit-notes.md" > "$ARTIFACTS_DIR/contracts/audit-notes.md" 2>/dev/null || true
+      BASE=$(git cat-file -p "$REF:candidate/base-branch" | tr -d " '\"\r\n"); [ -n "$BASE" ] || BASE=main
+      python -c "import json,sys; json.load(open(sys.argv[1]))" "$ARTIFACTS_DIR/contracts/impl.json" || { echo "restore-candidate: candidate impl.json is invalid JSON" >&2; exit 1; }
+      # This node runs inside a DISPOSABLE Archon task worktree; everything it needs is
+      # already in $ARTIFACTS_DIR (written above) + the candidate ref. A REUSED worktree
+      # carries stale dirt — notably Archon's own tracked .archon/gates.json — which must
+      # NOT block the freeze. So we clean the worktree instead of refusing. The refusal is
+      # kept ONLY as a real safety net for a non-task worktree (a real repo checkout).
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      case "$WT" in
+        *"/worktrees/"*|*task-archon-*|*task-fix-issue-*|*task-review-*) : ;;
+        *) if ! git diff --quiet || ! git diff --cached --quiet; then
+             echo "restore-candidate: uncommitted changes in non-task worktree ($WT); refusing destructive repoint" >&2; exit 1
+           fi ;;
+      esac
+      git fetch origin "$BASE" --quiet || { echo "restore-candidate: fetch origin/$BASE failed" >&2; exit 1; }
+      git reset --hard "origin/$BASE" >/dev/null 2>&1 || { echo "restore-candidate: reset to origin/$BASE failed" >&2; exit 1; }
+      git clean -fdq >/dev/null 2>&1 || true  # drop untracked stragglers so coverage greps see only the base tree
+      printf '%s' "$BASE" > "$ARTIFACTS_DIR/base-branch"
+      echo "restore-candidate: #$N restored from $REF; worktree repointed to origin/$BASE"
+      printf '%s' "$BASE"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4a2: VERIFY-CONTRACT-WITH-SPEC (s-family — anti-omission, coverage)
+  #   A coverage adversary (DIFFERENT mind — opus) checks every issue requirement maps to
+  #   an enforcing criterion. Policy: BOUNDED AUTO-FIX — kimi folds the uncovered
+  #   requirements into the contract (one round), the coverage mind re-checks, and the gate HARD-FAILS
+  #   only if requirements remain uncovered after that round. Catches OMISSION (e.g. #65's
+  #   "no-fork / single combiner" constraint that the v30 contract dropped). Runs BEFORE
+  #   ground-contract so any criteria it ADDS still get reality-checked.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: coverage-audit
+    provider: codex
+    model: gpt-5.4
+    depends_on: [restore-candidate, fetch-issue]
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Grep, Bash]
+    prompt: |
+      You are the SPEC-COVERAGE ADVERSARY — a DIFFERENT mind than the contract's authors.
+      Your ONLY job: verify the acceptance contract covers EVERY requirement the GitHub
+      issue states. A DROPPED requirement is how a PR passes its own contract yet fails the
+      issue (e.g. a "do not fork / ONE shared module" constraint that no criterion enforces,
+      so a duplicate stays alive).
+
+      ## GitHub issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read `$ARTIFACTS_DIR/contracts/impl.json` — the contract.
+
+      ## Method (do ALL)
+      1. Enumerate EVERY requirement the issue states as discrete items: each Deliverable
+         bullet, each "How to test" item, each Constraint, each MUST / MUST-NOT / "do not".
+      2. For each, find the criterion/criteria that ENFORCE it. A requirement is COVERED
+         only if some criterion's `verify` would FAIL an implementation that violated it
+         (e.g. a "no duplicate combiner outside the shared module" requirement needs a
+         verify that greps the OTHER files and fails if the logic is still there).
+      2b. NEGATIVE constraints — "must NOT", "no-fork", "do not duplicate", "X must not
+         exist outside Y", "stays unchanged" — are COVERED ONLY by a NEGATIVE assertion: a
+         verify that greps for the forbidden thing's ABSENCE (e.g.
+         `test $(git grep -nE '<forbidden token>' -- <other files> | grep -v <shared module>
+         | wc -l) -eq 0`). A POSITIVE / behavioral criterion (e.g. "the consumer CALLS the
+         shared helper", "delegation happens") does NOT cover a negative constraint: an impl
+         can pass the positive check while a leftover or dead duplicate still exists. If the
+         only enforcing criterion for a must-not requirement is positive, flag it UNCOVERED
+         and suggest the negative grep.
+      3. Flag every requirement with NO enforcing criterion as UNCOVERED.
+
+      ## GUARDRAIL (no gold-plating)
+      Flag ONLY requirements the issue EXPLICITLY states; quote the issue text for each.
+      Do NOT invent requirements.
+
+      Write `$ARTIFACTS_DIR/contracts/coverage-audit.md` — a numbered UNCOVERED list, each
+      with the issue quote, a suggested criterion `name`, and what its `verify` must assert.
+      Then return structured output.
+    output_format:
+      type: object
+      properties:
+        all_covered: { type: string, enum: ["true", "false"] }
+        uncovered:
+          type: array
+          items:
+            type: object
+            properties:
+              requirement:    { type: string }
+              issue_evidence: { type: string }
+              suggested_name: { type: string }
+              verify_hint:    { type: string }
+            required: [requirement]
+      required: [all_covered]
+
+  # APPLIER (kimi) — bounded ONE round. Folds the uncovered requirements into impl.json as
+  # new enforcing criteria (preserving all existing). No-op rewrite if nothing uncovered.
+  - id: coverage-apply
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [coverage-audit]
+    context: fresh
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      You integrate any MISSING-requirement findings into the contract. BOUNDED: one round.
+
+      Read:
+      - `$ARTIFACTS_DIR/contracts/impl.json` — the current contract.
+      - `$ARTIFACTS_DIR/contracts/coverage-audit.md` — uncovered requirements (may be empty).
+      - the issue (AUTHORITATIVE):
+
+        $fetch-issue.output
+
+      If the audit lists NO uncovered requirements, rewrite impl.json UNCHANGED — preserve
+      every existing criterion VERBATIM — and finish.
+      Otherwise ADD exactly one criterion per uncovered requirement: a concrete
+      `description`; a `verify` that FAILS a violating implementation and checks the WHOLE
+      scope (e.g. `! git grep -nE '<the duplicated logic>' -- <other files>` to prove a
+      combiner does NOT live outside the shared module); `threshold` 7; and — for any
+      concrete value claim — a `ground` anchor {locator, expected} reading the RAW artifact
+      (use `python`, NOT python3). PRESERVE all existing criteria; only ADD. Do not invent
+      requirements beyond the audit.
+
+      ## STRICT JSON - the contract MUST parse (json.load reads it downstream)
+      Do NOT emit raw regex backslash escapes (`\s` `\d` `\+`) — use POSIX classes
+      (`[[:space:]]`, `[0-9]`), literal spaces, or `grep -F`. Keep each `verify` single-line.
+      Validate before finishing and FIX until it prints OK:
+      ```bash
+      python -c "import json; json.load(open('$ARTIFACTS_DIR/contracts/impl.json')); print('contract OK')" \
+        || echo 'IMPL.JSON INVALID - fix the escapes and rewrite it'
+      ```
+      Write the merged contract to `$ARTIFACTS_DIR/contracts/impl.json`. Return it as
+      structured output.
+    output_format:
+      type: object
+      properties:
+        issue: { type: string }
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              name:        { type: string }
+              description: { type: string }
+              verify:      { type: string }
+              threshold:   { type: number }
+              ground:
+                type: object
+                properties:
+                  locator:  { type: string }
+                  expected: { type: string }
+            required: [name, description, verify, threshold]
+      required: [issue, criteria]
+
+  # RECHECK (same coverage mind) — bounded final coverage verdict on the UPDATED contract. Writes a
+  # machine verdict file the gate reads (no fragile structured-output interpolation in bash).
+  - id: coverage-recheck
+    provider: codex
+    model: gpt-5.4
+    depends_on: [coverage-apply]
+    context: fresh
+    idle_timeout: 600000
+    allowed_tools: [Read, Write, Grep, Bash]
+    prompt: |
+      Re-audit coverage after the applier folded in fixes (bounded FINAL check).
+
+      ## GitHub issue (AUTHORITATIVE spec)
+
+      $fetch-issue.output
+
+      Read the UPDATED `$ARTIFACTS_DIR/contracts/impl.json`. For each requirement the issue
+      states, confirm an ENFORCING criterion now exists (one whose verify fails a violator).
+      Set all_covered = "false" ONLY if a genuine issue requirement still has no enforcing
+      criterion.
+
+      Write `$ARTIFACTS_DIR/contracts/coverage-recheck.md` (verdict per requirement), AND
+      write the machine verdict file `$ARTIFACTS_DIR/contracts/coverage-verdict.json` with
+      the Write tool, containing exactly:
+      {"all_covered": "true"}   (or "false")
+      Then return the same as structured output.
+    output_format:
+      type: object
+      properties:
+        all_covered:     { type: string, enum: ["true", "false"] }
+        still_uncovered: { type: array, items: { type: string } }
+        summary:         { type: string }
+      required: [all_covered]
+
+  # GATE (deterministic) — fail-closed. Reads the verdict file; HARD-FAILS (exit 1) if
+  # requirements remain uncovered after the bounded fix round, or if the verdict is missing.
+  - id: coverage-gate
+    depends_on: [coverage-recheck]
+    timeout: 30000
+    bash: |
+      set -uo pipefail
+      V="$ARTIFACTS_DIR/contracts/coverage-verdict.json"
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      if [ ! -f "$V" ]; then
+        echo "coverage-gate: verdict file missing — failing closed" >&2; exit 1
+      fi
+      "$PY" - "$V" << 'PYEOF'
+      import json, sys
+      try:
+          d = json.load(open(sys.argv[1], encoding="utf-8"))
+      except Exception as e:
+          print(f"coverage-gate: cannot parse verdict ({e}) — failing closed", file=sys.stderr); sys.exit(1)
+      ok = str(d.get("all_covered")).strip().lower() == "true"
+      print("coverage-gate:", "PASS — all issue requirements covered" if ok
+            else "FAIL — requirements still uncovered after bounded fix (see coverage-recheck.md)")
+      sys.exit(0 if ok else 1)
+      PYEOF
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4b: GROUND-CONTRACT GATE (design B — anti-fabrication)
+  #   Execute every criterion's `ground` anchor against the REAL artifact in the base
+  #   worktree. If any asserted value contradicts reality, BLOCK the freeze (exit 1) so a
+  #   fabricated offset/byte/count contract never freezes. Criteria without a `ground`
+  #   anchor are skipped. Runs AFTER coverage so added criteria are reality-checked too.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: ground-contract
+    depends_on: [coverage-gate]
+    timeout: 120000
+    bash: |
+      set -uo pipefail
+      C="$ARTIFACTS_DIR/contracts/impl.json"
+      [ -f "$C" ] || { echo "ground-contract: $C missing" >&2; exit 1; }
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      ART="$ARTIFACTS_DIR" GATE_BASH="$(command -v bash)" "$PY" - "$C" << 'PYEOF'
+      import json, subprocess, sys, os
+      d = json.load(open(sys.argv[1], encoding="utf-8"))
+      crit = d.get("criteria", [])
+      anchored = [c for c in crit if isinstance(c.get("ground"), dict)
+                  and c["ground"].get("locator") and "expected" in c["ground"]]
+      print(f"ground-contract: {len(crit)} criteria, {len(anchored)} anchored")
+      fails = []
+      deferred = []
+      for c in anchored:
+          loc = c["ground"]["locator"]; exp = str(c["ground"]["expected"]).strip()
+          # DEFER: branch-identity locators are only true on the work branch during p2,
+          # not in this freeze worktree (a task branch). Enforced post-impl by verify.
+          if ("rev-parse --abbrev-ref" in loc) or ("symbolic-ref" in loc):
+              deferred.append((c["name"], "branch-identity locator (enforced on the work branch during p2 verify)"))
+              print(f"  [DEFER] {c['name']}: branch-identity locator")
+              continue
+          r = subprocess.run([os.environ.get("GATE_BASH") or "bash", "-c", loc], capture_output=True, text=True)
+          act = (r.stdout or "").strip()
+          # DEFER: not groundable at freeze (errors or empty) -> references an artifact the
+          # implementation will create; each criterion verify enforces it in p2/p3.
+          if r.returncode != 0 or act == "":
+              deferred.append((c["name"], f"not groundable at freeze (rc={r.returncode}, empty_output={act==''}); references a not-yet-created artifact"))
+              print(f"  [DEFER] {c['name']}: not groundable yet (rc={r.returncode}, actual {act!r})")
+              continue
+          # Artifact exists now: a non-empty value contradicting expected is a real fabrication.
+          ok = (act == exp)
+          print(f"  [{'PASS' if ok else 'FAIL'}] {c['name']}: expected {exp!r} actual {act!r}")
+          if not ok:
+              fails.append((c["name"], exp, act))
+      if deferred:
+          nfile = os.path.join(os.environ["ART"], "contracts", "deferred.md")
+          with open(nfile, "w", encoding="utf-8") as f:
+              f.write("# GROUND-CONTRACT - DEFERRED criteria (not groundable at freeze)" + chr(10)*2)
+              f.write("These reference the work branch or artifacts the implementation will create, so they cannot be ground-checked at freeze. They are NOT fabrications; each criterion verify enforces them in p2/p3 after implementation." + chr(10)*2)
+              for n, why in deferred:
+                  f.write(f"- **{n}**: {why}" + chr(10))
+          print(f"ground-contract: {len(deferred)} criterion(s) DEFERRED (not groundable at freeze) -> {nfile}")
+      if fails:
+          dfile = os.path.join(os.environ["ART"], "contracts", "defects.md")
+          with open(dfile, "w", encoding="utf-8") as f:
+              f.write("# CONTRACT DEFECTS - ground-contract gate (design B)" + chr(10)*2)
+              f.write("These criteria assert values the REAL artifact (present at freeze) contradicts. The contract was NOT frozen. Fix the expected values (read the artifact) and re-run." + chr(10)*2)
+              for n, e, a in fails:
+                  f.write(f"- **{n}**: contract says `{e}`, real artifact yields `{a}`" + chr(10))
+          print(f"GROUND-CONTRACT FAILED: {len(fails)} fabricated value(s) -- see {dfile}", file=sys.stderr)
+          sys.exit(1)
+      checked = len(anchored) - len(deferred)
+      print(f"GROUND-CONTRACT PASSED: {checked} anchored value(s) match reality, {len(deferred)} deferred to p2/p3.")
+      PYEOF
+
+  # ════════════════════════════════════════════════════════════════
+  # FREEZE — promote the gated contract to the canonical side ref + work branch.
+  #   Orphan commit under refs/archon-run/issue-<N>-kimi[-<suffix>] (not on any branch,
+  #   so .archon-run/ cannot leak into the PR). Work branch archon/fix-issue-<N>-kimi
+  #   is set to the base tip (or a from:<ref> override) and NOT checked out, so p2-3kc
+  #   claims it. Local-only: nothing pushed. Gated behind the freeze-gate(s) above.
+  # ════════════════════════════════════════════════════════════════
+
+  - id: freeze
+    depends_on: [restore-candidate, ground-contract]
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "freeze: could not resolve issue number" >&2; exit 1; }
+      SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'sfx:[A-Za-z0-9._-]+' | head -1 | sed 's/^sfx://')
+      [ -n "$SFX" ] || SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -owE 'v[0-9]+' | head -1)
+      FROM=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'from:[^[:space:]]+' | head -1 | sed 's/^from://')
+      BASE=$(cat "$ARTIFACTS_DIR/base-branch" 2>/dev/null | tr -d " '\"\r\n"); [ -n "$BASE" ] || BASE=main
+      BR="archon/fix-issue-$N-kimi${SFX:+-$SFX}"
+      REF="refs/archon-run/issue-$N-kimi${SFX:+-$SFX}"
+
+      [ -f "$ARTIFACTS_DIR/contracts/impl.json" ] || { echo "freeze: contracts/impl.json missing" >&2; exit 1; }
+      [ -f "$ARTIFACTS_DIR/investigation.md" ]     || { echo "freeze: investigation.md missing" >&2; exit 1; }
+
+      git config user.email  >/dev/null 2>&1 || git config user.email "archon@local"
+      git config user.name   >/dev/null 2>&1 || git config user.name  "Archon"
+
+      STAGE=$(mktemp -d)
+      printf '%s' "$BASE" > "$STAGE/base-branch"
+      add_blob() { [ -f "$1" ] || return 0; local blob; blob=$(git hash-object -w "$1"); git update-index --add --cacheinfo "100644,$blob,$2"; }
+      export GIT_INDEX_FILE="$STAGE/index"
+      git read-tree --empty
+      add_blob "$ARTIFACTS_DIR/investigation.md"          ".archon-run/issue-$N/plan.md"
+      add_blob "$ARTIFACTS_DIR/contracts/impl.json"       ".archon-run/issue-$N/contracts/impl.json"
+      add_blob "$ARTIFACTS_DIR/contracts/audit-notes.md"  ".archon-run/issue-$N/contracts/audit-notes.md"
+      add_blob "$STAGE/base-branch"                       ".archon-run/issue-$N/base-branch"
+      TREE=$(git write-tree)
+      HANDOFF=$(git commit-tree "$TREE" -m "archon handoff for #$N [s1g-c]")
+      unset GIT_INDEX_FILE
+      git update-ref "$REF" "$HANDOFF"
+
+      START=HEAD
+      if [ -n "$FROM" ]; then
+        git fetch origin "$FROM" --quiet 2>/dev/null || true
+        START=$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git rev-parse --verify "origin/$FROM^{commit}" 2>/dev/null \
+             || MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git rev-parse --verify "$FROM^{commit}" 2>/dev/null) \
+             || { echo "freeze: from:$FROM not resolvable" >&2; exit 1; }
+        echo "freeze: work branch starting from override ref $FROM ($START)" >&2
+      fi
+      git branch -f "$BR" "$START"
+      echo "p1g froze handoff for #$N -> $REF @ $(git rev-parse --short "$HANDOFF"); work branch $BR @ $(git rev-parse --short "$BR") (base=$BASE${FROM:+, from=$FROM})"
+      echo "Next: archon workflow run archonx-fix-github-issue-p2-3kc $N${SFX:+ $SFX}"

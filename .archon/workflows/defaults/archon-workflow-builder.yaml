@@ -6,6 +6,8 @@ description: |
   Does: Scans codebase -> extracts intent (JSON) -> generates YAML -> validates -> saves.
   NOT for: Editing existing workflows or creating non-workflow files.
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   - id: scan-codebase
     bash: |
@@ -63,7 +65,6 @@ nodes:
       Be specific and concrete. Each proposed node should have a clear type
       (bash, prompt, command, script, loop, or approval) and a one-line
       description of what it does.
-    model: small
     allowed_tools: []
     output_format:
       type: object

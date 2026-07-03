@@ -10,6 +10,8 @@ description: |
   Unlike the comprehensive review, this workflow classifies the PR first and only runs
   the review agents that are relevant. A 3-line typo fix skips test-coverage and docs-impact.
 
+provider: pi
+model: minimax/MiniMax-M2.7
 nodes:
   - id: scope
     command: archon-pr-review-scope
@@ -45,7 +47,8 @@ nodes:
 
       Provide your reasoning for each decision.
     depends_on: [scope]
-    model: small
+    provider: codex
+    model: gpt-5.5
     allowed_tools: []
     output_format:
       type: object
@@ -83,31 +86,43 @@ nodes:
     command: archon-code-review-agent
     depends_on: [classify, sync]
     when: "$classify.output.run_code_review == 'true'"
+    provider: codex
+    model: gpt-5.5
 
   - id: error-handling
     command: archon-error-handling-agent
     depends_on: [classify, sync]
     when: "$classify.output.run_error_handling == 'true'"
+    provider: codex
+    model: gpt-5.5
 
   - id: test-coverage
     command: archon-test-coverage-agent
     depends_on: [classify, sync]
     when: "$classify.output.run_test_coverage == 'true'"
+    provider: codex
+    model: gpt-5.5
 
   - id: comment-quality
     command: archon-comment-quality-agent
     depends_on: [classify, sync]
     when: "$classify.output.run_comment_quality == 'true'"
+    provider: codex
+    model: gpt-5.5
 
   - id: docs-impact
     command: archon-docs-impact-agent
     depends_on: [classify, sync]
     when: "$classify.output.run_docs_impact == 'true'"
+    provider: codex
+    model: gpt-5.5
 
   - id: synthesize
     command: archon-synthesize-review
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
+    provider: codex
+    model: gpt-5.5
 
   - id: implement-fixes
     command: archon-implement-review-fixes
