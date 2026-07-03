@@ -149,12 +149,16 @@ nodes:
 
         TIMEOUT DISCIPLINE: handle exactly ONE requirement this iteration. Be CONCISE.
 
-        ## Pick your requirement
+        ## Pick your requirement (the first one that has NO review file yet)
         ```bash
-        grep -vxF -f "$ARTIFACTS_DIR/req/reviewed.txt" "$ARTIFACTS_DIR/req/requirements.txt" | head -1
+        while IFS= read -r L; do
+          RID=$(printf '%s\n' "$L" | grep -oE '^R[0-9]+'); [ -n "$RID" ] || continue
+          [ -f "$ARTIFACTS_DIR/req/$RID.md" ] || { printf '%s\n' "$L"; break; }
+        done < "$ARTIFACTS_DIR/req/requirements.txt"
         ```
-        (Plain grep — NO process substitution `<(...)`.) If EMPTY, the queue is drained:
-        output `QUEUE EMPTY` and stop (review nothing). Else let REQ be that line (id + text).
+        (Plain shell — NO process substitution `<(...)`.) This prints the first requirement whose
+        review file `req/<id>.md` does NOT yet exist. If EMPTY, every requirement already has a review
+        file: output `QUEUE EMPTY` and stop (review nothing). Else let REQ be that line (id + text).
 
         ## Find the evidence (read only what you need)
         - PR head SHA: `PRHEAD=$(cat $ARTIFACTS_DIR/.pr-head-sha)`; BASE: `BASE=$(cat $ARTIFACTS_DIR/.pr-base)`.
@@ -179,13 +183,12 @@ nodes:
         - **Severity**: CRITICAL|HIGH|MEDIUM|LOW (for Gap/Risk; N/A for Met)
         ```
 
-        ## Mark done (exactly once, last):
-        ```bash
-        echo "REQ" >> "$ARTIFACTS_DIR/req/reviewed.txt"
-        ```
-        Then STOP your turn. Do NOT emit any completion phrase — a deterministic queue check
-        (until_bash below) ends the loop ONLY when reviewed.txt covers every requirement. This is
-        why the model can never declare the review "done" early: coverage is bash-authoritative.
+        ## Done — writing `req/<id>.md` above IS the completion marker for this requirement.
+        Do NOT write to any `reviewed.txt`; the review FILE is the only signal that counts.
+        Then STOP your turn. Do NOT emit any completion phrase — a deterministic check
+        (until_bash below) ends the loop ONLY when EVERY requirement has its `req/<id>.md` file. This
+        is why the model can never declare the review "done" early: coverage is bash-authoritative,
+        and a requirement only counts as reviewed once its review file actually exists.
       # `until` is set to a sentinel the prompt NEVER emits, so the model's self-declaration can no
       # longer stop the loop (the old `until: REQS_DONE` let M3 quit at 18/28 — completionDetected =
       # signalDetected || bashComplete, so a premature REQS_DONE ended it). Now ONLY until_bash (the
@@ -195,8 +198,12 @@ nodes:
       fresh_context: true
       until_bash: |
         A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
-        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        total=$( { grep -cE '^R[0-9]+' "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        # `done` counts actual R*.md review artifacts (the SAME honest signal emit-verdict uses),
+        # NOT reviewed.txt lines: the model can echo a REQ into reviewed.txt without writing its
+        # R*.md, which let the loop exit at reviewed_all=false. Counting artifacts keeps the loop
+        # running until every requirement has a real review file (honest max-iterations if it can't).
+        done=$( { ls "$A"/req/R*.md 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ── Resilience: resume if the loop died mid-queue (silent provider stream close is not retried) ──
@@ -206,8 +213,9 @@ nodes:
     timeout: 30000
     bash: |
       set -uo pipefail
-      total=$( { grep -c . "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-      done=$( { sort -u "$ARTIFACTS_DIR/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+      total=$( { grep -cE '^R[0-9]+' "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+      # honest signal: count R*.md artifacts, not reviewed.txt lines (see until_bash rationale)
+      done=$( { ls "$ARTIFACTS_DIR"/req/R*.md 2>/dev/null | grep -c . || echo 0; } | tail -1 )
       if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
 
   - id: review-requirements-resume
@@ -222,28 +230,33 @@ nodes:
 
         TIMEOUT DISCIPLINE: one requirement, concise.
 
-        ## Pick your requirement
+        ## Pick your requirement (the first one that has NO review file yet)
         ```bash
-        grep -vxF -f "$ARTIFACTS_DIR/req/reviewed.txt" "$ARTIFACTS_DIR/req/requirements.txt" | head -1
+        while IFS= read -r L; do
+          RID=$(printf '%s\n' "$L" | grep -oE '^R[0-9]+'); [ -n "$RID" ] || continue
+          [ -f "$ARTIFACTS_DIR/req/$RID.md" ] || { printf '%s\n' "$L"; break; }
+        done < "$ARTIFACTS_DIR/req/requirements.txt"
         ```
-        (Plain grep — NO process substitution.) If EMPTY, the queue is drained: output `QUEUE EMPTY` and stop.
+        (Plain shell — NO process substitution.) Prints the first requirement missing its
+        `req/<id>.md`. If EMPTY, the queue is drained: output `QUEUE EMPTY` and stop.
 
         ## Same context, classification, and per-requirement file format as the main coverage pass
         (origin/$BASE...$PRHEAD by SHA; Met/Gap/Stub/Risk; write `$ARTIFACTS_DIR/req/<Rid>.md`).
 
-        ## Mark done (exactly once, last):
-        ```bash
-        echo "REQ" >> "$ARTIFACTS_DIR/req/reviewed.txt"
-        ```
+        ## Done — writing `req/<id>.md` IS the completion marker. Do NOT write any `reviewed.txt`.
         Then STOP your turn. Do NOT emit any completion phrase — until_bash ends the loop only when
-        reviewed.txt covers every requirement.
+        every requirement has its `req/<id>.md` review file.
       until: __LOOP_ENDS_VIA_UNTIL_BASH_ONLY__
       max_iterations: 60
       fresh_context: true
       until_bash: |
         A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
-        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        total=$( { grep -cE '^R[0-9]+' "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        # `done` counts actual R*.md review artifacts (the SAME honest signal emit-verdict uses),
+        # NOT reviewed.txt lines: the model can echo a REQ into reviewed.txt without writing its
+        # R*.md, which let the loop exit at reviewed_all=false. Counting artifacts keeps the loop
+        # running until every requirement has a real review file (honest max-iterations if it can't).
+        done=$( { ls "$A"/req/R*.md 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ═══════════════════════════════════════════════════════════════
@@ -302,7 +315,17 @@ nodes:
               return len({l.strip() for l in open(os.path.join(A, p), encoding="utf-8") if l.strip()})
           except OSError:
               return 0
-      total    = count_lines("req/requirements.txt")
+      # total = REQUIREMENT rows only (lines starting with R<digits>). The checklist writer can
+      # prepend `# NOTE`/format-hint comment lines; counting raw non-empty lines inflated total
+      # above the R*.md artifact count, making reviewed_all unreachable (17 R-reqs but total=24).
+      try:
+          total = sum(
+              1
+              for l in open(os.path.join(A, "req/requirements.txt"), encoding="utf-8")
+              if re.match(r"^R[0-9]+", l.strip())
+          )
+      except OSError:
+          total = 0
       # reviewed is computed BELOW as the count of per-requirement analysis files actually
       # WRITTEN (R*.md) — NOT reviewed.txt lines. A model can echo reviewed.txt without doing
       # the work (GLM did exactly that: 19 "reviewed" but 1 R-file -> hollow spec-faithful).
