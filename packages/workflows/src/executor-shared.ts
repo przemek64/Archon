@@ -417,11 +417,22 @@ export function substituteWorkflowVariables(
   // Substitute basic variables
   // When shellSafe is true, skip user-controlled variables — they will be passed
   // via subprocess environment variables instead to prevent shell injection.
+  //
+  // Path-valued vars ($ARTIFACTS_DIR, $DOCS_DIR) are POSIX-normalized in shell
+  // contexts: on Windows the raw value holds backslashes (C:\Users\...), which
+  // `bash -c` treats as escape sequences and mangles the path. Git Bash accepts
+  // forward slashes (C:/Users/...), so normalizing here makes EVERY bash-context
+  // expansion safe at once (until_bash stop-checks, bash nodes, gates) instead of
+  // needing per-YAML `cygpath` band-aids. LLM prompts (non-shellSafe) keep the
+  // native form. $BASE_BRANCH is a branch name, not a path — never normalized.
+  const shellSafe = options?.shellSafe === true;
+  const artifactsDirSub = shellSafe ? artifactsDir.replace(/\\/g, '/') : artifactsDir;
+  const docsDirSub = shellSafe ? resolvedDocsDir.replace(/\\/g, '/') : resolvedDocsDir;
   let result = prompt
     .replace(/\$WORKFLOW_ID/g, workflowId)
-    .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
+    .replace(/\$ARTIFACTS_DIR/g, artifactsDirSub)
     .replace(/\$BASE_BRANCH/g, baseBranch)
-    .replace(/\$DOCS_DIR/g, resolvedDocsDir);
+    .replace(/\$DOCS_DIR/g, docsDirSub);
 
   if (!options?.shellSafe) {
     result = result

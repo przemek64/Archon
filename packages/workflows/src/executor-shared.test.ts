@@ -337,6 +337,38 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('cd /tmp/artifacts && git checkout main # run-1 docs/');
   });
+
+  it('POSIX-normalizes Windows path separators in $ARTIFACTS_DIR/$DOCS_DIR when shellSafe', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'cd "$ARTIFACTS_DIR" && ls "$DOCS_DIR"',
+      'run-1',
+      'msg',
+      'C:\\Users\\admin\\.archon\\runs\\abc\\req',
+      'main',
+      'C:\\Users\\admin\\proj\\docs',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { shellSafe: true }
+    );
+    // Backslashes (which bash -c would eat as escapes) become forward slashes.
+    expect(prompt).toBe(
+      'cd "C:/Users/admin/.archon/runs/abc/req" && ls "C:/Users/admin/proj/docs"'
+    );
+  });
+
+  it('leaves Windows path separators untouched when NOT shellSafe (LLM prompt)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Save to $ARTIFACTS_DIR',
+      'run-1',
+      'msg',
+      'C:\\Users\\admin\\runs\\abc',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Save to C:\\Users\\admin\\runs\\abc');
+  });
 });
 
 describe('buildPromptWithContext', () => {

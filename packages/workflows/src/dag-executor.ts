@@ -2550,6 +2550,13 @@ async function executeLoopNode(
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
           env: {
             ...process.env,
+            // Parity with executeBashNode/executeScriptNode: until_bash scripts that
+            // reference these via the environment (not textual substitution) were
+            // silently getting empty values, so an env-based path check always failed
+            // and the loop spun to max_iterations. Pass them explicitly.
+            ARTIFACTS_DIR: artifactsDir,
+            LOG_DIR: logDir,
+            BASE_BRANCH: baseBranch,
             USER_MESSAGE: workflowRun.user_message,
             ARGUMENTS: workflowRun.user_message,
             LOOP_USER_INPUT: i === startIteration ? (loopUserInput ?? '') : '',
