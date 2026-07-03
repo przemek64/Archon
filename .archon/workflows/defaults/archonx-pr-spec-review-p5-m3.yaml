@@ -194,8 +194,9 @@ nodes:
       max_iterations: 60
       fresh_context: true
       until_bash: |
-        total=$( { grep -c . "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$ARTIFACTS_DIR/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ── Resilience: resume if the loop died mid-queue (silent provider stream close is not retried) ──
@@ -240,8 +241,9 @@ nodes:
       max_iterations: 60
       fresh_context: true
       until_bash: |
-        total=$( { grep -c . "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$ARTIFACTS_DIR/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ═══════════════════════════════════════════════════════════════
@@ -301,7 +303,10 @@ nodes:
           except OSError:
               return 0
       total    = count_lines("req/requirements.txt")
-      reviewed = count_unique("req/reviewed.txt")   # unique: dup reviewed-lines must not inflate reviewed_all
+      # reviewed is computed BELOW as the count of per-requirement analysis files actually
+      # WRITTEN (R*.md) — NOT reviewed.txt lines. A model can echo reviewed.txt without doing
+      # the work (GLM did exactly that: 19 "reviewed" but 1 R-file -> hollow spec-faithful).
+      # Counting real artifacts makes reviewed_all un-fakeable.
       findings = []
       for f in sorted(glob.glob(os.path.join(A, "req", "R*.md"))):
           txt = open(f, encoding="utf-8").read()
@@ -313,6 +318,7 @@ nodes:
           mv = re.search(r'\*\*Severity\*\*:\s*([A-Za-z/]+)', txt)
           sev = (mv.group(1).strip().upper() if mv else "N/A")
           findings.append({"req": rid, "status": status, "severity": sev, "text": title})
+      reviewed = len(findings)   # AUTHORITATIVE: count of R*.md artifacts actually produced
       def sev_in(f, s): return f["severity"] in s
       counts = {"total": total, "reviewed": reviewed,
                 "met":  sum(1 for f in findings if f["status"] == "Met"),

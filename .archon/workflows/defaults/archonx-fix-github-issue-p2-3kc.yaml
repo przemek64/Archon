@@ -406,7 +406,8 @@ nodes:
       5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
       6. Create a DRAFT PR with an EXPLICIT head (do NOT let gh infer it):
          `gh pr create --draft --base $resolve-base-branch.output --head $resolve-work-branch.output`
-         - Title: concise, imperative mood, under 70 chars
+         - Title: MUST start with the literal `[#<issue-number>] ` prefix, then a concise
+           imperative summary, under 70 chars total (e.g. `[#72] Add DB sync helper for config tables`)
          - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, validation evidence, the adversarial acceptance verdict (which criteria passed and final scores), and `Fixes #...`.
          - PR body FIRST line MUST be the literal [Issue #<issue-number>] (e.g. for issue 72: [Issue #72]) on its own line, BEFORE any template or summary content.
          - Link to issue: include `Fixes #...` or `Closes #...`

@@ -13,6 +13,15 @@ Ensure the PR branch is up-to-date with the latest main branch before review. Re
 
 **Output artifact**: `$ARTIFACTS_DIR/review/sync-report.md` (only if rebase/conflicts occurred)
 
+> **HARD INVARIANT — never leave a rebase in progress.** When this command
+> finishes, `git status` MUST be clean of any rebase state (no `rebase-merge` /
+> `rebase-apply` dir, HEAD on the PR branch, not detached). A rebase that
+> conflicts and cannot be cleanly completed is a SYNC FAILURE: run
+> `git rebase --abort` to restore the PR head, write the `## ❌ Sync Failed`
+> output, and STOP. Never `git rebase --continue` past unresolved markers and
+> never let downstream review run on a half-rebased, detached worktree — that
+> collapses the worktree onto the base tip and makes the review see 0 files.
+
 ---
 
 ## Phase 1: CHECK - Determine if Sync Needed
@@ -161,11 +170,25 @@ git rebase --continue
 
 Repeat if more commits have conflicts.
 
+**After the loop, VERIFY the rebase actually finished** — do not assume:
+
+```bash
+GITDIR=$(git rev-parse --git-dir)
+if [ -d "$GITDIR/rebase-merge" ] || [ -d "$GITDIR/rebase-apply" ]; then
+  echo "Rebase did NOT complete — aborting to restore PR head."
+  git rebase --abort
+  # -> emit the "## ❌ Sync Failed" output and STOP. Do not proceed to review.
+fi
+```
+
+If you cannot resolve a conflict, **`git rebase --abort` and report SYNC_FAILED** —
+never leave the worktree mid-rebase.
+
 **PHASE_3_CHECKPOINT:**
 - [ ] All conflicts identified
 - [ ] Simple conflicts auto-resolved
 - [ ] Complex conflicts resolved with reasoning
-- [ ] Rebase completed
+- [ ] Rebase completed AND verified (no rebase-merge/rebase-apply dir remains)
 
 ---
 
@@ -209,7 +232,24 @@ bun run lint
 
 ## Phase 5: PUSH - Update Remote
 
-### 5.1 Confirm Branch and Push
+> **⚠️ DESTRUCTIVE — GATED.** This step rewrites the remote PR branch. A
+> reviewer/validator MUST NEVER push. Only run Phase 5 when this sync was
+> invoked explicitly for merge preparation, signalled by
+> `ARCHON_SYNC_ALLOW_PUSH=1`. Review and validate workflows do not set it.
+
+### 5.0 Push Guard
+
+```bash
+if [ "${ARCHON_SYNC_ALLOW_PUSH:-0}" != "1" ]; then
+  echo "ARCHON_SYNC_ALLOW_PUSH not set — skipping push. Rebase is local-only."
+  echo "Reviewing/validating a PR must never rewrite its branch."
+  # Skip Phase 5 entirely; proceed to Phase 6.
+fi
+```
+
+If the guard is not satisfied, **skip the rest of Phase 5** and continue to Phase 6 with the rebase kept local only.
+
+### 5.1 Confirm Branch and Push (only if ARCHON_SYNC_ALLOW_PUSH=1)
 
 Confirm you're on `$PR_HEAD`, then push:
 
@@ -217,7 +257,9 @@ Confirm you're on `$PR_HEAD`, then push:
 git push --force-with-lease origin $PR_HEAD
 ```
 
-**Note**: `--force-with-lease` is safer - fails if someone else pushed.
+**Note**: `--force-with-lease` is safer - fails if someone else pushed. It is
+NOT sufficient on its own — a stale-but-fast-forward-compatible local ref can
+still clobber good work, which is why the Phase 5 guard exists.
 
 ### 5.2 Verify Push
 

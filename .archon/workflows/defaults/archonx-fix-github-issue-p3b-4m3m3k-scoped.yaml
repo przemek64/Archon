@@ -1,0 +1,222 @@
+name: archonx-fix-github-issue-p3b-4m3m3k-scoped
+description: |
+  PART 3b of the split fix-issue chain — the SELF-FIX half of p3 (see p1 for the full design,
+  and p3a for the review half). Runs ONLY after the p3 gate is APPROVED (auto-judge tier1/tier2
+  or a human GitHub PR "Approve"), dispatched by the orchestrator as a FRESH run — never a
+  resumed pause. Bootstraps the PR branch, reads the frozen review bundle back from
+  refs/archon-run/issue-<N>-p3review[-<suffix>], STALE-GUARDS on the reviewed PR head SHA, then
+  aggressively self-fixes findings (kimi), simplifies changed code (kimi), and mechanically
+  scope-fences out-of-scope churn back to the reviewed head.
+
+  STALE-GUARD: the reviewed head (frozen by p3a) must be an ANCESTOR of the current PR head.
+  If the branch was rebased/force-pushed since review, the gate is stale -> refuse (re-run p3a).
+  This never self-fixes against a review of code that no longer exists.
+
+  SCOPE-FENCE: reverts any modification to a tracked file that is NEITHER in the PR's own
+  changed-file set (review/files.txt) NOR net-new, back to the REVIEWED head — killing
+  out-of-scope style churn deterministically (the #123 class). Baseline = the frozen reviewed
+  head, so a re-run of p3b (self-fix commits already on top) fences consistently.
+  Triggers: dispatched by the orchestrator on p3 APPROVE. Manual: "p3b self-fix #123".
+  NOT for: planning (p1), implementing (p2), review (p3a), one-shot fixes (the monolith).
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: RESOLVE ISSUE + BOOTSTRAP FROM THE PR
+  # ═══════════════════════════════════════════════════════════════
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If ambiguous, use `gh issue list` to search for matching issues and pick the best match.
+      - IGNORE any trailing variant tokens like `v2`, `sfx:foo`, or `from:<ref>` — they are NOT the issue number.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example: 709
+
+  # Land the worktree on the PR head and resolve the PR number.
+  - id: bootstrap
+    depends_on: [extract-issue-number]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      [ -n "$N" ] || { echo "bootstrap: could not resolve issue number" >&2; exit 1; }
+      # --- variant args (parsed identically in p1/p2/p3) ---
+      SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'sfx:[A-Za-z0-9._-]+' | head -1 | sed 's/^sfx://')
+      [ -n "$SFX" ] || SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -owE 'v[0-9]+' | head -1)
+      FROM=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'from:[^[:space:]]+' | head -1 | sed 's/^from://')
+      BR="archon/fix-issue-$N-kimi${SFX:+-$SFX}"
+      [ -n "$FROM" ] && BR="$FROM"   # escape hatch: review an explicit branch
+      git worktree prune 2>/dev/null || true
+      git fetch origin --quiet 2>/dev/null || true
+      # p2 pushed the PR head to origin/$BR — prefer it (resolves any local
+      # branch-checked-out-in-another-worktree contention). Fall back to the local ref.
+      # Force the checkout: Archon dirties its own tracked .archon/gates.json on worktree
+      # init and a reused/stale worktree may carry other mods — a plain checkout refuses.
+      # Discard that dirt, then force, so a stale worktree is harmless.
+      git checkout -- .archon/ 2>/dev/null || true
+      git clean -fdq .archon/ 2>/dev/null || true
+      if git rev-parse --verify "origin/$BR" >/dev/null 2>&1; then
+        if ! git checkout -f -B "$BR" "origin/$BR" 2>/dev/null; then
+          git checkout -f "$BR" 2>/dev/null && git reset --hard "origin/$BR" >/dev/null 2>&1
+        fi
+      else
+        git checkout -f -B "$BR" "$BR" 2>/dev/null || git checkout -f "$BR" 2>/dev/null || {
+          echo "bootstrap: cannot check out $BR (neither origin nor local). Run p2 first" >&2; exit 1; }
+      fi
+      PR=$(gh pr list --head "$BR" --json number -q '.[0].number' 2>/dev/null)
+      [ -n "$PR" ] || { echo "bootstrap: no open PR with head $BR — run p2 first" >&2; exit 1; }
+      echo "$PR" > "$ARTIFACTS_DIR/.pr-number"
+      echo "$N"  > "$ARTIFACTS_DIR/.issue-number"
+      git rev-parse HEAD > "$ARTIFACTS_DIR/.pr-head-sha"   # scope-fence baseline (PR head before any self-fix/simplify)
+      mkdir -p "$ARTIFACTS_DIR/review"
+      echo "p3 bootstrap: on $BR @ $(git rev-parse --short HEAD), PR #$PR"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: UNFREEZE the p3a review bundle + STALE-GUARD
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: unfreeze-review
+    depends_on: [bootstrap]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      N=$(cat "$ARTIFACTS_DIR/.issue-number" 2>/dev/null | tr -d ' \n')
+      [ -n "$N" ] || { echo "unfreeze-review: no issue number" >&2; exit 1; }
+      SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -oE 'sfx:[A-Za-z0-9._-]+' | head -1 | sed 's/^sfx://')
+      [ -n "$SFX" ] || SFX=$(printf '%s' "${ARGUMENTS:-}" | grep -owE 'v[0-9]+' | head -1)
+      REF="refs/archon-run/issue-$N-p3review${SFX:+-$SFX}"
+      git rev-parse --verify "$REF" >/dev/null 2>&1 || { echo "unfreeze-review: $REF missing — run p3a first" >&2; exit 1; }
+      mkdir -p "$ARTIFACTS_DIR/review/deep"
+      git show "$REF:p3review/review/consolidated-review.md" > "$ARTIFACTS_DIR/review/consolidated-review.md" 2>/dev/null || true
+      git show "$REF:p3review/review/final-summary.md"       > "$ARTIFACTS_DIR/review/final-summary.md"       2>/dev/null || true
+      git show "$REF:p3review/review/files.txt"              > "$ARTIFACTS_DIR/review/files.txt"              2>/dev/null || true
+      git show "$REF:p3review/p3-verdict.json"               > "$ARTIFACTS_DIR/p3-verdict.json"               2>/dev/null || true
+      [ -s "$ARTIFACTS_DIR/review/consolidated-review.md" ] || { echo "unfreeze-review: consolidated-review.md empty after restore" >&2; exit 1; }
+      [ -s "$ARTIFACTS_DIR/review/files.txt" ] || { echo "unfreeze-review: files.txt empty after restore" >&2; exit 1; }
+      # per-file deep findings (the coverage set self-fix consumes)
+      for p in $(git ls-tree -r --name-only "$REF" 2>/dev/null | grep '^p3review/review/deep/'); do
+        git show "$REF:$p" > "$ARTIFACTS_DIR/review/deep/$(basename "$p")" 2>/dev/null || true
+      done
+      # ── STALE-GUARD: reviewed head must be an ANCESTOR of the current PR head ──
+      FROZEN=$(git show "$REF:p3review/pr-head-sha" 2>/dev/null | tr -d ' \n')
+      [ -n "$FROZEN" ] || { echo "unfreeze-review: frozen pr-head-sha missing" >&2; exit 1; }
+      git cat-file -e "$FROZEN" 2>/dev/null || git fetch origin --quiet 2>/dev/null || true
+      if ! git merge-base --is-ancestor "$FROZEN" HEAD 2>/dev/null; then
+        echo "unfreeze-review: STALE GATE — reviewed head $FROZEN is not an ancestor of current PR head $(git rev-parse HEAD 2>/dev/null)." >&2
+        echo "unfreeze-review: the branch was rebased/force-pushed since review. Re-run p3a, re-approve. Refusing to self-fix stale code." >&2
+        exit 1
+      fi
+      # scope-fence baseline = the REVIEWED head (revert out-of-scope churn back to it; consistent on re-runs).
+      printf '%s' "$FROZEN" > "$ARTIFACTS_DIR/.pr-head-sha"
+      echo "unfreeze-review: restored p3 review bundle from $REF (reviewed head ${FROZEN:0:8}, files=$(grep -c . "$ARTIFACTS_DIR/review/files.txt"))"
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: SELF-FIX  (kimi) — consumes consolidated-review.md
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: self-fix
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    command: archon-self-fix-all
+    depends_on: [unfreeze-review]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: SIMPLIFY (kimi)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3b: SCOPE-FENCE (mechanical) — revert out-of-scope churn
+  #   Allowlist = the PR's OWN changed files (review/files.txt).
+  #   Any tracked file modified since PR head that is NOT in the allowlist
+  #   and is NOT net-new (didn't exist at origin/$BASE) gets restored to PR
+  #   head. Net-new files (e.g. a test self-fix legitimately added) are kept.
+  #   This kills the #123-style style churn deterministically — no LLM seat.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scope-fence
+    depends_on: [simplify]
+    trigger_rule: all_done
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      ALLOW="$ARTIFACTS_DIR/review/files.txt"
+      PRHEAD=$(cat "$ARTIFACTS_DIR/.pr-head-sha" 2>/dev/null | tr -d ' \n')
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      if [ -z "$PRHEAD" ] || [ ! -f "$ALLOW" ]; then
+        echo "scope-fence: missing PR head sha or allowlist — SKIP (no fence applied)" >&2
+        exit 0
+      fi
+      : > "$ARTIFACTS_DIR/review/.fenced.txt"
+      BASE=$(gh pr view "$PR" --json baseRefName -q '.baseRefName' 2>/dev/null)
+      [ -n "$BASE" ] && git fetch origin "$BASE" --quiet 2>/dev/null || true
+      # Files touched by self-fix/simplify since PR head (added/copied/modified/renamed; drop deletes).
+      CHANGED=$(git diff --name-only --diff-filter=ACMR "$PRHEAD"..HEAD 2>/dev/null || true)
+      [ -n "$CHANGED" ] || { echo "scope-fence: no commits since PR head — nothing to fence"; exit 0; }
+      REVERTED=""
+      echo "$CHANGED" | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # In PR scope? keep.
+        if grep -qxF -- "$f" "$ALLOW"; then continue; fi
+        # Net-new (did NOT exist at origin/$BASE)? keep — a legit new file.
+        if [ -n "$BASE" ] && ! git cat-file -e "origin/$BASE:$f" 2>/dev/null; then
+          echo "scope-fence: KEEP net-new out-of-scope file $f"
+          continue
+        fi
+        # Out-of-scope churn on a pre-existing file -> restore to PR head.
+        git checkout "$PRHEAD" -- "$f" 2>/dev/null && echo "$f" >> "$ARTIFACTS_DIR/review/.fenced.txt"
+      done
+      if [ -s "$ARTIFACTS_DIR/review/.fenced.txt" ]; then
+        echo "scope-fence: reverting out-of-scope churn:"; sed 's/^/  - /' "$ARTIFACTS_DIR/review/.fenced.txt"
+        # Stage ONLY the fenced files by name (never -A).
+        while IFS= read -r f; do [ -n "$f" ] && git add -- "$f"; done < "$ARTIFACTS_DIR/review/.fenced.txt"
+        git commit -m "scope-fence: revert out-of-scope churn to PR-affected files only" >/dev/null 2>&1 || true
+        git push 2>&1 | tail -2 || true
+        echo "scope-fence: done — $(grep -c . "$ARTIFACTS_DIR/review/.fenced.txt") file(s) restored to PR head"
+      else
+        echo "scope-fence: clean — every post-review change stayed within PR scope (or was net-new)"
+      fi
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [scope-fence]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: COMPLETION MARKER — signals self-fix done -> p5 eligible.
+  #   p3a posts gf-stage:p3 (review done). p3b posts gf-stage:p3b so the
+  #   orchestrator advances p3b -> p5 only after self-fix actually landed.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: p3b-marker
+    depends_on: [report]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      [ -n "$PR" ] || { echo "p3b-marker: no PR number — cannot post gf-stage:p3b" >&2; exit 1; }
+      BODY=$(printf '<!-- gf-stage:p3b -->\np3b self-fix + simplify + scope-fence complete.')
+      gh pr comment "$PR" --body "$BODY" && echo "p3b-marker: posted gf-stage:p3b for PR #$PR"

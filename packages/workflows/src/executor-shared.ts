@@ -42,6 +42,7 @@ export const FATAL_PATTERNS = [
 /** Transient error patterns - temporary issues that may resolve with retry */
 export const TRANSIENT_PATTERNS = [
   'timeout',
+  'timed out', // provider SDK message text, e.g. "Request timed out." (no 'timeout' substring)
   'econnrefused',
   'econnreset',
   'etimedout',

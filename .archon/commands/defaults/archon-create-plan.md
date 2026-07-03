@@ -1,6 +1,6 @@
 ---
 description: Create comprehensive feature implementation plan with codebase analysis and research
-argument-hint: <feature description | path/to/prd.md>
+argument-hint: <feature description | path/to/prd.md | issue #N>
 ---
 
 # Create Implementation Plan
@@ -30,11 +30,27 @@ Transform "$ARGUMENTS" into a battle-tested implementation plan through systemat
 
 | Input Pattern | Type | Action |
 |---------------|------|--------|
+| References a GitHub issue (e.g. `issue #N`, `#N`, `fix issue 73`) | GitHub issue | Fetch the issue, use it as the spec (see 0.0) |
 | Ends with `.prd.md` | PRD file | Parse PRD, select next phase |
 | Ends with `.md` and contains "Implementation Phases" | PRD file | Parse PRD, select next phase |
 | File path that exists | Document | Read and extract feature description |
 | Free-form text | Description | Use directly as feature input |
 | Empty/blank | Error | STOP - require input |
+
+### 0.0 If GitHub Issue Referenced (do this FIRST)
+
+If `$ARGUMENTS` names or references a GitHub issue number, you MUST fetch the issue
+yourself — DO NOT stop to ask for the body. Extract the first integer as the issue
+number and run:
+
+```bash
+gh issue view <N> --json title,body,labels,comments,state,url,author
+```
+
+Use the returned `title` + `body` (and relevant `comments`) as the AUTHORITATIVE
+feature spec for the rest of this command. Only if `gh` fails (no such issue / not
+authenticated) may you fall back to treating `$ARGUMENTS` as free-form text. Never
+emit a "send me the issue body" response when an issue number is present.
 
 ### 0.2 If PRD File Detected
 

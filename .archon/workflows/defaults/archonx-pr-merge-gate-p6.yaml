@@ -22,20 +22,24 @@ nodes:
     bash: |
       export PATH="$PATH:/home/user/.local/bin"
       set -uo pipefail
-      mkdir -p "$ARTIFACTS_DIR"
+      # win-path stopgap: $ARTIFACTS_DIR is a Windows backslash path; bash -c eats the
+      # backslashes (mangles `C:\Users\…` -> `C:Users…`). Normalize to a POSIX path for
+      # all SHELL file ops. (Python nodes read os.environ["ARTIFACTS_DIR"] directly — unaffected.)
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      mkdir -p "$A"
       PR=$(echo "${ARGUMENTS:-}" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
       [ -n "$PR" ] || PR=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
       [ -n "$PR" ] || PR=$(gh pr view --json number -q '.number' 2>/dev/null)
       echo "$PR" | grep -qE '^[0-9]+$' || { echo "FATAL: no PR number in ARGUMENTS=${ARGUMENTS:-}" >&2; exit 1; }
-      echo "$PR" > "$ARTIFACTS_DIR/.pr-number"
-      gh repo view --json nameWithOwner -q '.nameWithOwner' > "$ARTIFACTS_DIR/.repo"
-      gh pr view "$PR" --json baseRefName -q '.baseRefName' > "$ARTIFACTS_DIR/.pr-base"
-      gh pr view "$PR" --json headRefName -q '.headRefName' > "$ARTIFACTS_DIR/.pr-head"
+      echo "$PR" > "$A/.pr-number"
+      gh repo view --json nameWithOwner -q '.nameWithOwner' > "$A/.repo"
+      gh pr view "$PR" --json baseRefName -q '.baseRefName' > "$A/.pr-base"
+      gh pr view "$PR" --json headRefName -q '.headRefName' > "$A/.pr-head"
       BODY=$(gh pr view "$PR" --json body -q '.body')
       ISSUE=$(echo "$BODY" | grep -oiE '(fix|fixe[sd]|close[sd]?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | head -1)
       [ -n "$ISSUE" ] || ISSUE=$(echo "$BODY" | grep -oE '#[0-9]+' | grep -oE '[0-9]+' | head -1)
-      echo "${ISSUE:-}" > "$ARTIFACTS_DIR/.issue-number"
-      echo "p6 merge-gate: PR #$PR base=$(cat $ARTIFACTS_DIR/.pr-base) issue=#${ISSUE:-none}"
+      echo "${ISSUE:-}" > "$A/.issue-number"
+      echo "p6 merge-gate: PR #$PR base=$(cat "$A/.pr-base") issue=#${ISSUE:-none}"
 
   # ── Read the LATEST gf-verdict:p5 block (across PR comments AND review bodies). Fail-closed. ──
   - id: read-verdict
@@ -44,10 +48,11 @@ nodes:
     bash: |
       export PATH="$PATH:/home/user/.local/bin"
       set -uo pipefail
-      PR=$(cat "$ARTIFACTS_DIR/.pr-number"); REPO=$(cat "$ARTIFACTS_DIR/.repo")
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      PR=$(cat "$A/.pr-number"); REPO=$(cat "$A/.repo")
       # PR issue-comments + review bodies — p5 posts via `gh pr review` (a review body).
-      gh pr view "$PR" --repo "$REPO" --json comments -q '.comments[].body' > "$ARTIFACTS_DIR/.allbodies" 2>/dev/null || true
-      gh api "repos/$REPO/pulls/$PR/reviews" -q '.[].body' >> "$ARTIFACTS_DIR/.allbodies" 2>/dev/null || true
+      gh pr view "$PR" --repo "$REPO" --json comments -q '.comments[].body' > "$A/.allbodies" 2>/dev/null || true
+      gh api "repos/$REPO/pulls/$PR/reviews" -q '.[].body' >> "$A/.allbodies" 2>/dev/null || true
       PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
       "$PY" - << 'PYEOF'
       import json, os, re, sys
@@ -77,8 +82,9 @@ nodes:
     bash: |
       export PATH="$PATH:/home/user/.local/bin"
       set -uo pipefail
-      PR=$(cat "$ARTIFACTS_DIR/.pr-number"); REPO=$(cat "$ARTIFACTS_DIR/.repo")
-      ISSUE=$(cat "$ARTIFACTS_DIR/.issue-number"); BASE=$(cat "$ARTIFACTS_DIR/.pr-base")
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      PR=$(cat "$A/.pr-number"); REPO=$(cat "$A/.repo")
+      ISSUE=$(cat "$A/.issue-number"); BASE=$(cat "$A/.pr-base")
       PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
 
       # MECHANICAL gate: mergeable iff review completed AND no CRITICAL/HIGH blocking.
@@ -124,7 +130,7 @@ nodes:
       if [ "$MERGEABLE" != "yes" ]; then
         # HOLD: post reasons WITHOUT a gf-stage:p6 marker, then FAIL so the orchestrator
         # reaps "terminal w/o artifact" -> retry -> park p6:blocked for a human.
-        gh pr comment "$PR" --repo "$REPO" --body-file "$ARTIFACTS_DIR/p6-body.md" || true
+        gh pr comment "$PR" --repo "$REPO" --body-file "$A/p6-body.md" || true
         echo "p6: HOLD — not mergeable (see PR comment). Failing run so orchestrator parks p6:blocked."
         exit 1
       fi
@@ -143,22 +149,22 @@ nodes:
           TGT=$(gh issue view "$ISSUE" --repo "$REPO" --json labels -q '.labels[].name' 2>/dev/null | grep -E '^target:' | head -1 || true)
           LBL=""; [ -n "$TGT" ] && LBL="--label \"$TGT\""
           TITLE="Follow-up: residual findings from #$ISSUE (PR #$PR)"
-          NEW=$(eval gh issue create --repo "\"$REPO\"" --title "\"$TITLE\"" --body-file "\"$ARTIFACTS_DIR/p6-followup.md\"" $LBL --json url -q '.url' 2>/dev/null || \
-                eval gh issue create --repo "\"$REPO\"" --title "\"$TITLE\"" --body-file "\"$ARTIFACTS_DIR/p6-followup.md\"" $LBL 2>/dev/null)
+          NEW=$(eval gh issue create --repo "\"$REPO\"" --title "\"$TITLE\"" --body-file "\"$A/p6-followup.md\"" $LBL --json url -q '.url' 2>/dev/null || \
+                eval gh issue create --repo "\"$REPO\"" --title "\"$TITLE\"" --body-file "\"$A/p6-followup.md\"" $LBL 2>/dev/null)
           FOLLOWUP="$NEW"
         fi
       fi
 
       # Post the p6 decision comment WITH the gf-stage marker + gf-verdict:p6 block.
       {
-        cat "$ARTIFACTS_DIR/p6-body.md"
+        cat "$A/p6-body.md"
         [ -n "$FOLLOWUP" ] && printf '\nFollow-up issue: %s\n' "$FOLLOWUP"
         printf '\n<!-- gf-stage:p6 -->\n'
         printf '<!-- gf-verdict:p6\n'
         "$PY" -c "import json,os;v=json.load(open(os.path.join(os.environ['ARTIFACTS_DIR'],'p5-verdict.json')));print(json.dumps({'schema':'gf-verdict/1','stage':'p6','pr':int('$PR'),'decision':'merge','followup':'$FOLLOWUP','p5_verdict':v.get('verdict')},indent=2))"
         printf '\n-->\n'
-      } > "$ARTIFACTS_DIR/p6-comment.md"
-      gh pr comment "$PR" --repo "$REPO" --body-file "$ARTIFACTS_DIR/p6-comment.md"
+      } > "$A/p6-comment.md"
+      gh pr comment "$PR" --repo "$REPO" --body-file "$A/p6-comment.md"
 
       # Phase 1 = recommend only (human merges via pr-validated). Phase 2 = auto-merge.
       if [ "${ARCHON_P6_AUTOMERGE:-0}" = "1" ]; then
