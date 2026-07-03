@@ -151,7 +151,10 @@ nodes:
 
         ## Pick your requirement
         ```bash
-        grep -vxF -f "$ARTIFACTS_DIR/req/reviewed.txt" "$ARTIFACTS_DIR/req/requirements.txt" | head -1
+        while IFS= read -r L; do
+          RID=$(printf '%s\n' "$L" | grep -oE '^R[0-9]+'); [ -n "$RID" ] || continue
+          [ -f "$ARTIFACTS_DIR/req/$RID.md" ] || { printf '%s\n' "$L"; break; }
+        done < "$ARTIFACTS_DIR/req/requirements.txt"
         ```
         (Plain grep — NO process substitution `<(...)`.) If EMPTY, the queue is drained:
         output `QUEUE EMPTY` and stop (review nothing). Else let REQ be that line (id + text).
@@ -195,8 +198,8 @@ nodes:
       fresh_context: true
       until_bash: |
         A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
-        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        total=$( { grep -cE '^R[0-9]+' "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { ls "$A"/req/R*.md 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ── Resilience: resume if the loop died mid-queue (silent provider stream close is not retried) ──
@@ -206,8 +209,8 @@ nodes:
     timeout: 30000
     bash: |
       set -uo pipefail
-      total=$( { grep -c . "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-      done=$( { sort -u "$ARTIFACTS_DIR/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+      total=$( { grep -cE '^R[0-9]+' "$ARTIFACTS_DIR/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+      done=$( { ls "$ARTIFACTS_DIR"/req/R*.md 2>/dev/null | grep -c . || echo 0; } | tail -1 )
       if [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]; then printf DONE; else printf MORE; fi
 
   - id: review-requirements-resume
@@ -224,7 +227,10 @@ nodes:
 
         ## Pick your requirement
         ```bash
-        grep -vxF -f "$ARTIFACTS_DIR/req/reviewed.txt" "$ARTIFACTS_DIR/req/requirements.txt" | head -1
+        while IFS= read -r L; do
+          RID=$(printf '%s\n' "$L" | grep -oE '^R[0-9]+'); [ -n "$RID" ] || continue
+          [ -f "$ARTIFACTS_DIR/req/$RID.md" ] || { printf '%s\n' "$L"; break; }
+        done < "$ARTIFACTS_DIR/req/requirements.txt"
         ```
         (Plain grep — NO process substitution.) If EMPTY, the queue is drained: output `QUEUE EMPTY` and stop.
 
@@ -242,8 +248,8 @@ nodes:
       fresh_context: true
       until_bash: |
         A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
-        total=$( { grep -c . "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
-        done=$( { sort -u "$A/req/reviewed.txt" 2>/dev/null | grep -c . || echo 0; } | tail -1 )
+        total=$( { grep -cE '^R[0-9]+' "$A/req/requirements.txt" 2>/dev/null || echo 0; } | tail -1 )
+        done=$( { ls "$A"/req/R*.md 2>/dev/null | grep -c . || echo 0; } | tail -1 )
         [ "$total" -eq 0 ] || [ "$done" -ge "$total" ]
 
   # ═══════════════════════════════════════════════════════════════
@@ -302,7 +308,16 @@ nodes:
               return len({l.strip() for l in open(os.path.join(A, p), encoding="utf-8") if l.strip()})
           except OSError:
               return 0
-      total    = count_lines("req/requirements.txt")
+      # total = REQUIREMENT rows only (^R<digits>); build-checklist may prepend # NOTE /
+      # format-hint comment lines that inflate a raw line count above the R*.md count.
+      try:
+          total = sum(
+              1
+              for l in open(os.path.join(A, "req/requirements.txt"), encoding="utf-8")
+              if re.match(r"^R[0-9]+", l.strip())
+          )
+      except OSError:
+          total = 0
       # reviewed is computed BELOW as the count of per-requirement analysis files actually
       # WRITTEN (R*.md) — NOT reviewed.txt lines. A model can echo reviewed.txt without doing
       # the work (GLM did exactly that: 19 "reviewed" but 1 R-file -> hollow spec-faithful).
