@@ -213,6 +213,25 @@ nodes:
 
         ---
 
+        ## Context budget (applies to BOTH roles — do NOT overflow the model window)
+        The model context window is finite (~256K tokens). Reading whole large files
+        into a single turn overflows it and fails the run with a token-limit error.
+        Discipline every source read:
+        - NEVER read an entire file larger than ~800 lines, and NEVER read a binary or
+          whole-file blob (e.g. UTF-32LE `.cfg`, `.db`, `.bin`, images) in full. Use
+          RANGED reads only: `read` with offset/limit, `sed -n 'START,ENDp'`, or
+          `grep -n <symbol>` to pull just the region a criterion touches.
+        - Locate before you read: `grep -n` for the function/class/symbol, then read the
+          surrounding range — never `cat` a large file to "see everything".
+        - For whole-file `.cfg`/binary artifacts, do NOT load raw bytes into context;
+          inspect via a tiny script that prints only length + the specific decoded slice
+          you need (offsets, a header, one record), never the full content.
+        - Keep each turn's total reads well within the window. If the work won't fit,
+          NARROW to the single criterion you are handling this round rather than loading
+          everything at once.
+
+        ---
+
         ## ROLE: GENERATOR (phase = "building")
 
         You are a software engineer implementing the fix so it SURVIVES an adversarial

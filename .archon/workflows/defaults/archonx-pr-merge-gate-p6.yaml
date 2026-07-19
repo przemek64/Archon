@@ -75,7 +75,18 @@ nodes:
       # (labeltool CLAUDE.md Learned Rules §1). Reviewers keep mis-flagging it HIGH/MEDIUM
       # and dumping it into blocking[]. Demote ONLY that convention out of blocking into
       # deferrable; every other finding (incl. unrelated MEDIUMs) is left exactly as-is.
-      _CONV_RE = re.compile(r'(?:VERSION.{0,60}(?:increment|patch|bump))|(?:\.archive\b)', re.I | re.S)
+      # Matches the convention however reviewers phrase it: VERSION bump/increment/patch,
+      # the literal `.archive` path, "archive copy", the "Version/Archive" pairing (slash or
+      # space), and "frozen snapshot" copies. Kept narrow to this one convention.
+      _CONV_RE = re.compile(
+          r'VERSION.{0,60}(?:increment|patch|bump)'
+          r'|(?:increment|patch|bump).{0,60}VERSION'
+          r'|\.archive\b'
+          r'|archive\s+cop(?:y|ies)'
+          r'|version\s*[/\\&+]{1,3}\s*archive'          # "Version/Archive", "Version & Archive"
+          r'|version\s+and\s+archive'
+          r'|frozen\s+snapshot\s+cop(?:y|ies)',
+          re.I | re.S)
       _kept, _moved = [], []
       for _it in v.get("blocking", []):
           if _CONV_RE.search(_it.get("text", "")):
@@ -146,11 +157,23 @@ nodes:
       print(decision)
       PYEOF
 
-      if [ "$MERGEABLE" != "yes" ]; then
-        # HOLD: post reasons WITHOUT a gf-stage:p6 marker, then FAIL so the orchestrator
-        # reaps "terminal w/o artifact" -> retry -> park p6:blocked for a human.
+      if [ "$MERGEABLE" = "no" ]; then
+        # LEGITIMATE HOLD: review completed with CRITICAL/HIGH blocking findings.
+        # Post reasons WITHOUT a gf-stage:p6 marker so the artifact stays absent and the
+        # orchestrator keeps parking p6:blocked (reap is artifact-derived, NOT run-status
+        # derived — see reap() step 4 + executions_since, which never inspect status).
+        # EXIT 0 so a clean hold reads "completed" (green), not "failed" (red): red is now
+        # reserved for a genuine crash, so triage can tell the two apart at a glance.
+        # Leave a p6-hold.json breadcrumb (distinct from the gf-stage:p6 advance-marker)
+        # for anyone reading the artifacts dir.
         gh pr comment "$PR" --repo "$REPO" --body-file "$A/p6-body.md" || true
-        echo "p6: HOLD — not mergeable (see PR comment). Failing run so orchestrator parks p6:blocked."
+        "$PY" -c "import json,os;v=json.load(open(os.path.join(os.environ['ARTIFACTS_DIR'],'p5-verdict.json')));json.dump({'schema':'gf-hold/1','stage':'p6','pr':int('$PR'),'issue':int('$ISSUE' or 0),'verdict':v.get('verdict'),'blocking':v.get('blocking',[])},open(os.path.join(os.environ['ARTIFACTS_DIR'],'p6-hold.json'),'w'),indent=2)" || true
+        echo "p6: HOLD — not mergeable (blocking findings; see PR comment). Clean hold; orchestrator parks p6:blocked via artifact-absence."
+        exit 0
+      elif [ "$MERGEABLE" != "yes" ]; then
+        # Verdict could not be read (MERGEABLE is neither yes nor no) -> genuine error.
+        # FAIL (red) so it's not mistaken for a clean hold and retries/surfaces.
+        echo "p6: ERROR — could not read p5 verdict (MERGEABLE='$MERGEABLE'). Failing run."
         exit 1
       fi
 
