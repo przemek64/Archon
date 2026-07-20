@@ -1,0 +1,205 @@
+name: archonx-pr-spec-fix-p5b
+description: |
+  grey-factory stage P5b — the SPEC-FIX half of the p5a/p5b split (mirrors p3a→p3b, but for
+  the spec-coverage review). UNLIKE p3b, p5b is NOT a pipeline stage the orchestrator dispatches.
+  It is a TOOL the FABLE SUPERVISOR invokes by hand — Fable is the human here; a human would
+  normally run the fix themselves, and p5b is that fix, driven by Fable.
+
+  WHEN Fable runs it: at a `p6:blocked` adjudication, after Fable has read gf-verdict:p5 (and the
+  advisory gf-verdict:p4), verified each blocking finding against the PR-head code, and decided
+  which are REAL and worth fixing in place (vs merge-over-false / rewind / escalate). Fable passes
+  the APPROVED fix-list in ARGUMENTS; p5b applies ONLY those, never the whole review (so it can't
+  "fix" a false CRITICAL like #2's R01/R51). After p5b lands, Fable re-checks (optionally re-runs
+  p5a) and merges — the merge decision stays Fable's, not p5b's.
+
+  Invoke: archon workflow run archonx-pr-spec-fix-p5b "<PR#> fix: <finding ids / description>;
+          skip: <false findings>"  (runner: pr-workflow — first integer = PR).
+
+  Does: bootstrap the PR head (like p3b) → gather the p5a spec-review + Fable's fix-list →
+        kimi self-fix ONLY the approved findings → kimi simplify → mechanical scope-fence →
+        completion report → post `<!-- gf-stage:p5b -->`. Read-only on everything else.
+
+  NOT for: reviewing (p5a), the merge decision (Fable/p6), planning (p1), implementing (p2),
+  code-review fixes (p3b). Never dispatched by orchestrator.py.
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: RESOLVE PR + ISSUE, BOOTSTRAP ONTO THE PR HEAD  (as p3b)
+  # ═══════════════════════════════════════════════════════════════
+  - id: resolve-pr
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      mkdir -p "$A/review"
+      PR=$(echo "${ARGUMENTS:-}" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
+      [ -n "$PR" ] || PR=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1)
+      [ -n "$PR" ] || PR=$(gh pr view --json number -q '.number' 2>/dev/null)
+      echo "$PR" | grep -qE '^[0-9]+$' || { echo "FATAL: no PR number in ARGUMENTS=${ARGUMENTS:-}" >&2; exit 1; }
+      echo "$PR" > "$A/.pr-number"
+      BR=$(gh pr view "$PR" --json headRefName -q '.headRefName')
+      echo "$BR" > "$A/.pr-branch"
+      BODY=$(gh pr view "$PR" --json body -q '.body')
+      ISSUE=$(echo "$BODY" | grep -oiE '(fix|fixe[sd]|close[sd]?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | head -1)
+      [ -n "$ISSUE" ] || ISSUE=$(echo "$BODY" | grep -oE '#[0-9]+' | grep -oE '[0-9]+' | head -1)
+      echo "${ISSUE:-}" > "$A/.issue-number"
+      echo "p5b: PR #$PR head=$BR issue=#${ISSUE:-none}"
+
+  # Land the worktree on the PR head (force-checkout pattern copied from p3b bootstrap).
+  - id: bootstrap
+    depends_on: [resolve-pr]
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      BR=$(cat "$A/.pr-branch")
+      git worktree prune 2>/dev/null || true
+      git fetch origin --quiet 2>/dev/null || true
+      git checkout -- .archon/ 2>/dev/null || true
+      git clean -fdq .archon/ 2>/dev/null || true
+      if git rev-parse --verify "origin/$BR" >/dev/null 2>&1; then
+        if ! git checkout -f -B "$BR" "origin/$BR" 2>/dev/null; then
+          git checkout -f "$BR" 2>/dev/null && git reset --hard "origin/$BR" >/dev/null 2>&1
+        fi
+      else
+        git checkout -f -B "$BR" "$BR" 2>/dev/null || git checkout -f "$BR" 2>/dev/null || {
+          echo "bootstrap: cannot check out $BR" >&2; exit 1; }
+      fi
+      git rev-parse HEAD > "$A/.pr-head-sha"   # scope-fence baseline (PR head before any fix)
+      echo "p5b bootstrap: on $BR @ $(git rev-parse --short HEAD)"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: GATHER the p5a spec-review + FABLE's approved fix-list
+  #   (replaces p3b's unfreeze-from-frozen-ref; here the "what to fix"
+  #    is Fable's decision, passed in ARGUMENTS, scoped to the p5a review.)
+  # ═══════════════════════════════════════════════════════════════
+  - id: gather-fix-task
+    depends_on: [bootstrap]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      PR=$(cat "$A/.pr-number")
+      # The p5a spec-review prose (posted as a PR review body) — the finding catalogue.
+      gh api "repos/{owner}/{repo}/pulls/$PR/reviews" -q '.[].body' > "$A/review/p5a-reviews.md" 2>/dev/null || true
+      gh pr view "$PR" --json comments -q '.comments[].body' >> "$A/review/p5a-reviews.md" 2>/dev/null || true
+      # Fable's fix-list = the ARGUMENTS text after the PR number (natural language: which
+      # findings to fix, which to skip as false). Preserved verbatim for the self-fix seat.
+      printf '%s\n' "${ARGUMENTS:-}" > "$A/review/fable-fix-instructions.txt"
+      # The PR's own changed files = the scope-fence allowlist (p5b must not roam wider).
+      BASE=$(gh pr view "$PR" --json baseRefName -q '.baseRefName')
+      echo "$BASE" > "$A/.pr-base"
+      git fetch origin "$BASE" --quiet 2>/dev/null || true
+      git diff --name-only --diff-filter=d "origin/$BASE...HEAD" | { grep -vE '^[.]archive/' || true; } > "$A/review/files.txt"
+      echo "p5b gather: $(grep -c . "$A/review/files.txt" 2>/dev/null || echo 0) PR files; fix-instructions $(wc -c < "$A/review/fable-fix-instructions.txt") bytes"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: SELF-FIX (kimi) — apply ONLY Fable's approved findings
+  # ═══════════════════════════════════════════════════════════════
+  - id: self-fix
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    depends_on: [gather-fix-task]
+    context: fresh
+    prompt: |
+      You are applying a TARGETED spec-fix that the Fable supervisor (the human-in-the-loop)
+      explicitly approved. Fix ONLY what Fable listed — never the whole review, never a finding
+      Fable told you to skip, never anything you personally think is worth changing. Fable already
+      verified each finding against the code; do not re-litigate. Read-only outside the fixes.
+
+      ## Fable's approved fix-list (AUTHORITATIVE — do exactly this)
+      `$ARTIFACTS_DIR/review/fable-fix-instructions.txt`
+
+      ## The p5a spec-review finding catalogue (context for the finding ids Fable names)
+      `$ARTIFACTS_DIR/review/p5a-reviews.md` — look up each finding id Fable approved, read the
+      quoted spec line + location, and implement exactly that requirement. Ignore every finding
+      Fable did NOT list (especially any Fable marked false/skip).
+
+      ## Scope
+      - You are on the PR branch at its head. Edit files in place.
+      - Prefer to touch only files already in `$ARTIFACTS_DIR/review/files.txt` (the PR's own
+        changed set). A NEW file is allowed only if a Fable-approved finding explicitly needs it.
+      - Follow repo rules (VERSION bump + `.archive` copy for Python per CLAUDE.md).
+      - Commit your changes with a clear message. Do NOT push — a later node handles that.
+
+      When done, output a one-line summary of exactly which findings you fixed.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: SIMPLIFY (kimi)
+  # ═══════════════════════════════════════════════════════════════
+  - id: simplify
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3b: SCOPE-FENCE (mechanical) — copied from p3b. Revert any
+  #   out-of-scope churn back to the PR head; keep net-new files.
+  # ═══════════════════════════════════════════════════════════════
+  - id: scope-fence
+    depends_on: [simplify]
+    trigger_rule: all_done
+    timeout: 120000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      ALLOW="$A/review/files.txt"
+      PRHEAD=$(cat "$A/.pr-head-sha" 2>/dev/null | tr -d ' \n')
+      BASE=$(cat "$A/.pr-base" 2>/dev/null | tr -d ' \n')
+      if [ -z "$PRHEAD" ] || [ ! -f "$ALLOW" ]; then
+        echo "scope-fence: missing PR head sha or allowlist — SKIP" >&2; exit 0
+      fi
+      : > "$A/review/.fenced.txt"
+      [ -n "$BASE" ] && git fetch origin "$BASE" --quiet 2>/dev/null || true
+      CHANGED=$(git diff --name-only --diff-filter=ACMR "$PRHEAD"..HEAD 2>/dev/null || true)
+      [ -n "$CHANGED" ] || { echo "scope-fence: no commits since PR head — nothing to fence"; exit 0; }
+      echo "$CHANGED" | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        if grep -qxF -- "$f" "$ALLOW"; then continue; fi
+        if [ -n "$BASE" ] && ! git cat-file -e "origin/$BASE:$f" 2>/dev/null; then
+          echo "scope-fence: KEEP net-new out-of-scope file $f"; continue
+        fi
+        git checkout "$PRHEAD" -- "$f" 2>/dev/null && echo "$f" >> "$A/review/.fenced.txt"
+      done
+      if [ -s "$A/review/.fenced.txt" ]; then
+        echo "scope-fence: reverting out-of-scope churn:"; sed 's/^/  - /' "$A/review/.fenced.txt"
+        while IFS= read -r f; do [ -n "$f" ] && git add -- "$f"; done < "$A/review/.fenced.txt"
+        git commit -m "scope-fence: revert out-of-scope churn to PR-affected files only" >/dev/null 2>&1 || true
+      fi
+      git push 2>&1 | tail -2 || true
+      echo "scope-fence: done"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: REPORT
+  # ═══════════════════════════════════════════════════════════════
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [scope-fence]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: MARKER — gf-stage:p5b. ADVISORY record only: p5b is Fable-
+  #   invoked, so the orchestrator ignores this marker. It tells Fable
+  #   (and a human reading the PR) that the targeted spec-fix landed.
+  # ═══════════════════════════════════════════════════════════════
+  - id: p5b-marker
+    depends_on: [report]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      A=$(cygpath -u "$ARTIFACTS_DIR" 2>/dev/null || printf '%s' "$ARTIFACTS_DIR")
+      PR=$(cat "$A/.pr-number" 2>/dev/null | tr -d ' \n')
+      [ -n "$PR" ] || { echo "p5b-marker: no PR number" >&2; exit 1; }
+      BODY=$(printf '<!-- gf-stage:p5b -->\np5b targeted spec-fix (Fable-approved findings) complete. Re-review (p5a) / merge is Fable'\''s call.')
+      gh pr comment "$PR" --body "$BODY" && echo "p5b-marker: posted gf-stage:p5b for PR #$PR"

@@ -1,0 +1,312 @@
+name: archonx-pr-review-p4-2axis-c
+description: |
+  Use when: User wants a PR reviewed along TWO independent axes — Standards (does the code follow
+  this repo's documented standards + a fixed Fowler code-smell baseline?) and Spec (does the code
+  faithfully implement the originating issue / PRD / spec?). Single PR. Read-only.
+  Triggers: "two-axis review PR", "p4 review #123", "standards+spec review".
+  Does: resolve PR + linked issue + pinned head SHA -> gather standards sources + spec sources ->
+        run the Standards axis and the Spec axis as TWO PARALLEL sub-agents (they never pollute
+        each other's context) -> aggregate side-by-side under ## Standards / ## Spec -> emit a
+        machine-readable gf-verdict:p4 block -> post to the PR.
+  NOT for: fixing issues, merging, multi-PR cross-cutting analysis.
+
+  PORTED from the Claude Code skill mattpocock/skills `engineering/code-review` (two-axis review).
+  Faithful to the skill's core: two axes kept deliberately SEPARATE so one never masks the other;
+  Standards carries the fixed Fowler smell baseline (pasted in full into the axis prompt, since the
+  sub-agent has no other access to it); documented repo standards OVERRIDE the baseline; baseline
+  smells are always judgement calls, never hard violations; skip anything tooling already enforces.
+
+  PIPELINE ROLE: wired into the grey-factory pipeline as stage `p4` — an ADVISORY SUPPORT review
+  that runs sequentially BEFORE p5a (the spec-coverage review). It posts its report + gf-verdict:p4
+  as a PLAIN PR COMMENT only (never a review STATE), so it cannot perturb p5a's independent verdict.
+  The p6 merge-gate reads gf-verdict:p4 "trigger-a-look": a p4 CRITICAL/HIGH routes the merge to a
+  Fable look (never auto-HOLDs on p4 alone). Can also run standalone for A/B:
+    archon workflow run archonx-pr-review-p4-2axis-m3 <PR#>
+  The "fixed point" of the skill = the PR's merge-base with its base branch; everything diffs
+  origin/<base>...<prhead> by SHA (avoids the worktree-is-not-the-PR-branch false-verdict bug).
+
+  ── P4 MODEL VARIANTS — trailing letter = the REVIEW mind on BOTH axes ──
+  Setup + aggregate stay cheap (M2.7 / bash). The variant swaps only the two axis review seats:
+    -m3  MiniMax-M3    (cheap; whole-diff single call — keep PRs small to dodge the ~500s timeout)
+    -c   codex/gpt-5.4 (strong cross-mind; no single-call timeout)
+  Built to A/B the two mounts head-to-head on the same PR.  THIS FILE = -c (codex/gpt-5.4).
+
+provider: pi
+model: minimax/MiniMax-M2.7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: RESOLVE — PR, base, pinned head SHA, linked issue
+  # ═══════════════════════════════════════════════════════════════
+  - id: fetch-pr
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR/spec" "$ARTIFACTS_DIR/std" "$ARTIFACTS_DIR/axis"
+      # Resolve PR number: first integer in ARGUMENTS -> PR of current branch.
+      PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
+      if [ -z "$PR_NUMBER" ]; then PR_NUMBER=$(echo "${ARGUMENTS:-}" | grep -oE '[0-9]+' | head -1); fi
+      if [ -z "$PR_NUMBER" ]; then PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null); fi
+      if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+        echo "FATAL: no PR number in ARGUMENTS=${ARGUMENTS:-} and branch has no PR" >&2; exit 1
+      fi
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+
+      BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      echo "$BASE" > "$ARTIFACTS_DIR/.pr-base"
+      git fetch origin "$BASE" --quiet || true
+      git fetch origin "pull/$PR_NUMBER/head" --quiet || true
+      PRHEAD=$(git rev-parse FETCH_HEAD)
+      echo "$PRHEAD" > "$ARTIFACTS_DIR/.pr-head-sha"
+
+      # Linked issue: "Fixes/Closes/Resolves #N" in the PR body, else first #N.
+      BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body')
+      ISSUE=$(echo "$BODY" | grep -oiE '(fix|fixe[sd]|close[sd]?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE" ]; then ISSUE=$(echo "$BODY" | grep -oE '#[0-9]+' | grep -oE '[0-9]+' | head -1); fi
+      echo "${ISSUE:-}" > "$ARTIFACTS_DIR/.issue-number"
+
+      echo "p4-2axis: PR #$PR_NUMBER  base=$BASE  head=$PRHEAD  issue=#${ISSUE:-none}"
+      gh pr view "$PR_NUMBER" --json number,title,url,headRefName,baseRefName,additions,deletions,changedFiles,state,author,isDraft
+
+  # ── Gather the diff-under-review + BOTH axes' reference sources ──
+  - id: resolve-sources
+    depends_on: [fetch-pr]
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number"); ISSUE=$(cat "$ARTIFACTS_DIR/.issue-number")
+      BASE=$(cat "$ARTIFACTS_DIR/.pr-base"); PRHEAD=$(cat "$ARTIFACTS_DIR/.pr-head-sha")
+
+      # ---- The diff under review (pinned by SHA, .archive excluded) ----
+      git diff --name-only --diff-filter=d "origin/$BASE...$PRHEAD" | { grep -vE '^[.]archive/' || true; } > "$ARTIFACTS_DIR/.files.txt"
+      git diff "origin/$BASE...$PRHEAD" -- $(cat "$ARTIFACTS_DIR/.files.txt") > "$ARTIFACTS_DIR/.diff.patch" 2>/dev/null || \
+        git diff "origin/$BASE...$PRHEAD" > "$ARTIFACTS_DIR/.diff.patch"
+      git log "origin/$BASE..$PRHEAD" --oneline > "$ARTIFACTS_DIR/.commits.txt" 2>/dev/null || true
+      echo "changed files:"; sed 's/^/  /' "$ARTIFACTS_DIR/.files.txt"
+
+      # ---- SPEC axis sources: issue body + every doc it/the PR names (base-branch version) ----
+      if [ -n "$ISSUE" ]; then
+        gh issue view "$ISSUE" --json body -q '.body' > "$ARTIFACTS_DIR/spec/issue-body.md" 2>/dev/null || : > "$ARTIFACTS_DIR/spec/issue-body.md"
+      else
+        : > "$ARTIFACTS_DIR/spec/issue-body.md"
+      fi
+      REFS=$( { cat "$ARTIFACTS_DIR/spec/issue-body.md"; gh pr view "$PR" --json body -q '.body'; } \
+        | grep -oE '(docs/adr/[0-9A-Za-z._/-]+\.md|[A-Za-z0-9._/-]*PRD[A-Za-z0-9._/-]*\.md|[A-Za-z0-9._/-]*-spec\.md|GLOSSARY\.md)' \
+        | sort -u )
+      for f in $REFS; do
+        dest="$ARTIFACTS_DIR/spec/$(echo "$f" | tr '/' '_')"
+        git show "origin/$BASE:$f" > "$dest" 2>/dev/null && echo "  spec source: $f" || echo "  (missing on base: $f)"
+      done
+      # Does the Spec axis have anything to work with?
+      if [ -s "$ARTIFACTS_DIR/spec/issue-body.md" ] || [ -n "$REFS" ]; then echo yes > "$ARTIFACTS_DIR/.has-spec"; else echo no > "$ARTIFACTS_DIR/.has-spec"; fi
+
+      # ---- STANDARDS axis sources: whatever the repo documents about how to write code ----
+      for f in CODING_STANDARDS.md CONTRIBUTING.md CLAUDE.md STYLE.md docs/CODING_STANDARDS.md; do
+        git show "origin/$BASE:$f" > "$ARTIFACTS_DIR/std/$(echo "$f" | tr '/' '_')" 2>/dev/null && echo "  standards source: $f" || true
+      done
+      ls "$ARTIFACTS_DIR/std" 2>/dev/null | grep -q . && echo "standards docs found" || echo "no documented standards -> baseline only"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: THE TWO AXES — run as PARALLEL sub-agents (no edge between them)
+  # ═══════════════════════════════════════════════════════════════
+
+  # ── AXIS 1: STANDARDS — documented repo standards + fixed Fowler smell baseline ──
+  - id: standards-axis
+    provider: codex
+    model: gpt-5.4
+    depends_on: [resolve-sources]
+    idle_timeout: 600000
+    prompt: |
+      You are the STANDARDS axis of a two-axis code review. Judge ONLY: does this diff conform to
+      how code should be written here? Ignore whether it implements the right feature (that is the
+      other axis). Be CONCISE (target < 400 words). Read-only — never edit anything.
+
+      ## The change under review
+      - Diff (authoritative): `$ARTIFACTS_DIR/.diff.patch`   Changed files: `$ARTIFACTS_DIR/.files.txt`
+      - Commits: `$ARTIFACTS_DIR/.commits.txt`
+      - A file's PR-head contents when you need more than the hunk:
+        `git show "$(cat $ARTIFACTS_DIR/.pr-head-sha):<file>"` (do NOT `cat <file>` — the worktree
+        may not be the PR branch).
+
+      ## Documented repo standards (these OVERRIDE the baseline below)
+      Read every file in `$ARTIFACTS_DIR/std/` (may be empty). `ls $ARTIFACTS_DIR/std/`. A documented
+      repo standard always wins; where it endorses something the baseline would flag, SUPPRESS the smell.
+
+      ## The Fowler smell BASELINE (Refactoring ch.3) — always applies, even with zero docs
+      Each is a labelled JUDGEMENT CALL ("possible Feature Envy"), never a hard violation. Skip anything
+      tooling (linter/formatter/type-checker) already enforces. Match each against the diff:
+      - Mysterious Name — a name that doesn't reveal what it does/holds. -> rename; if no honest name comes, the design's murky.
+      - Duplicated Code — the same logic shape in more than one hunk/file in the change. -> extract, call from both.
+      - Feature Envy — a method reaching into another object's data more than its own. -> move it onto the data it envies.
+      - Data Clumps — the same few fields/params keep travelling together. -> bundle into one type, pass that.
+      - Primitive Obsession — a primitive/string standing in for a domain concept. -> give the concept its own small type.
+      - Repeated Switches — the same switch/if-cascade on the same type recurs. -> polymorphism, or one shared map.
+      - Shotgun Surgery — one logical change forces scattered edits across many files. -> gather what changes together.
+      - Divergent Change — one file edited for several unrelated reasons. -> split so each changes for one reason.
+      - Speculative Generality — abstraction/params/hooks for needs the spec doesn't have. -> delete, inline back.
+      - Message Chains — long a.b().c().d() navigation the caller shouldn't depend on. -> hide behind one method.
+      - Middle Man — a class/function that mostly just delegates onward. -> cut it, call the target direct.
+      - Refused Bequest — a subclass/implementer that ignores most of what it inherits. -> drop inheritance, use composition.
+
+      ## Emit TWO files
+      1. `$ARTIFACTS_DIR/std/standards.md` — prose report, per file/hunk where relevant:
+         (a) every place the diff violates a DOCUMENTED standard: cite the standard (file + the rule) —
+             these may be HARD violations; (b) any BASELINE smell you spot: name it and quote the hunk —
+             always a judgement call. If nothing: say "no standards findings".
+      2. `$ARTIFACTS_DIR/axis/standards.json` — a JSON array (possibly empty) of findings:
+         [{"axis":"standards","kind":"documented|smell","severity":"CRITICAL|HIGH|MEDIUM|LOW",
+           "title":"<short>","location":"file:line or file"}]
+         Baseline smells are LOW/MEDIUM by nature; reserve HIGH/CRITICAL for documented-standard breaches
+         that actually break the code or a hard project rule. Emit STRICT JSON (double quotes, no trailing
+         commas, no comments). Output a one-line count confirmation only.
+
+  # ── AXIS 2: SPEC — does the diff faithfully implement the originating issue / PRD / spec? ──
+  - id: spec-axis
+    provider: codex
+    model: gpt-5.4
+    depends_on: [resolve-sources]
+    idle_timeout: 600000
+    prompt: |
+      You are the SPEC axis of a two-axis code review. Judge ONLY: does this diff faithfully implement
+      what the originating issue / PRD / spec asked for? Ignore code taste/standards (the other axis).
+      Be CONCISE (target < 400 words). Read-only — never edit anything.
+
+      ## Is there a spec at all?
+      Run: `cat $ARTIFACTS_DIR/.has-spec`. If it prints `no`, write `$ARTIFACTS_DIR/spec/spec.md`
+      containing exactly `no spec available` and `$ARTIFACTS_DIR/axis/spec.json` containing `[]`, then
+      output "no spec" and STOP. Otherwise continue.
+
+      ## The authoritative spec (bounded input — read only these)
+      - Issue body: `$ARTIFACTS_DIR/spec/issue-body.md`
+      - Every cited doc copied into `$ARTIFACTS_DIR/spec/` (ADRs, PRD, *-spec, GLOSSARY) —
+        `ls $ARTIFACTS_DIR/spec/`. ADRs own the DECISION (polarity, ordering, encoding, recovery
+        semantics); read the ADR, not the issue's summary of it.
+
+      ## The change under review
+      - Diff: `$ARTIFACTS_DIR/.diff.patch`   Changed files: `$ARTIFACTS_DIR/.files.txt`
+      - A file's PR-head contents: `git show "$(cat $ARTIFACTS_DIR/.pr-head-sha):<file>"`.
+
+      ## Emit TWO files
+      1. `$ARTIFACTS_DIR/spec/spec.md` — prose report. Quote the spec line for EACH finding:
+         (a) requirements the spec asked for that are MISSING or partial;
+         (b) behaviour in the diff that WASN'T asked for (scope creep);
+         (c) requirements that look implemented but where the implementation looks WRONG.
+         Do NOT invent requirements the spec doesn't state. If all met: say "spec faithful".
+      2. `$ARTIFACTS_DIR/axis/spec.json` — a JSON array (possibly empty) of findings:
+         [{"axis":"spec","kind":"missing|scope-creep|wrong","severity":"CRITICAL|HIGH|MEDIUM|LOW",
+           "title":"<short>","location":"file:line or spec-ref"}]
+         Emit STRICT JSON (double quotes, no trailing commas, no comments). One-line count confirmation only.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: AGGREGATE — side by side, axes kept SEPARATE (never reranked across)
+  # ═══════════════════════════════════════════════════════════════
+  - id: aggregate
+    provider: pi
+    model: minimax/MiniMax-M2.7
+    depends_on: [standards-axis, spec-axis]
+    trigger_rule: all_done
+    context: fresh
+    allowed_tools: [Read, Write, Glob, Grep, Bash]
+    prompt: |
+      Assemble the two axis reports into one review. Do NOT invent, merge, or rerank findings across
+      axes — the two axes are deliberately separate so one never masks the other.
+
+      Read `$ARTIFACTS_DIR/std/standards.md` and `$ARTIFACTS_DIR/spec/spec.md`.
+      Write `$ARTIFACTS_DIR/review.md`:
+        # PR Two-Axis Review: PR #<n>   (PR# from `cat $ARTIFACTS_DIR/.pr-number`; note linked issue)
+        ## Standards
+        <the standards report, verbatim or lightly cleaned>
+        ## Spec
+        <the spec report, verbatim or lightly cleaned; or "no spec available">
+        ## Summary
+        One line PER AXIS: total findings on that axis + the single worst issue within it.
+        Do NOT pick a cross-axis winner.
+      Output a one-line confirmation only.
+
+  # ── MECHANICAL gf-verdict:p4 block (no LLM) — parse the two axis JSON files into counts ──
+  - id: emit-verdict
+    depends_on: [aggregate]
+    trigger_rule: all_done
+    timeout: 60000
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
+      "$PY" - << 'PYEOF'
+      import json, os
+      A = os.environ["ARTIFACTS_DIR"]
+      def readf(p, d=""):
+          try: return open(os.path.join(A, p), encoding="utf-8").read().strip()
+          except OSError: return d
+      def load(p):
+          raw = readf(p)
+          if not raw: return []
+          try:
+              v = json.loads(raw)
+              return v if isinstance(v, list) else []
+          except Exception:
+              return []   # malformed axis JSON -> treat as no structured findings (prose still posted)
+      pr = readf(".pr-number"); issue = readf(".issue-number")
+      base = readf(".pr-base"); head = readf(".pr-head-sha")
+      std = load("axis/standards.json"); spec = load("axis/spec.json")
+      SEV = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+      def norm(items, axis):
+          out = []
+          for f in items:
+              if not isinstance(f, dict): continue
+              s = str(f.get("severity", "")).upper()
+              if s not in SEV: s = "LOW"
+              out.append({"axis": axis, "kind": f.get("kind", ""), "severity": s,
+                          "title": str(f.get("title", ""))[:200], "location": str(f.get("location", ""))})
+          return out
+      std = norm(std, "standards"); spec = norm(spec, "spec")
+      allf = std + spec
+      def counts(items):
+          return {s: sum(1 for f in items if f["severity"] == s) for s in SEV}
+      blocking = [f for f in allf if f["severity"] in ("CRITICAL", "HIGH")]
+      has_spec = readf(".has-spec") != "no"
+      if blocking:
+          verdict = "changes-requested"
+      elif allf:
+          verdict = "review-with-notes"
+      else:
+          verdict = "clean"
+      out = {"schema": "gf-verdict/1", "stage": "p4", "review": "two-axis",
+             "pr": int(pr) if pr.isdigit() else pr,
+             "issue": int(issue) if issue.isdigit() else issue,
+             "head_sha": head, "base": base, "spec_available": has_spec,
+             "standards": {"total": len(std), "by_severity": counts(std)},
+             "spec": {"total": len(spec), "by_severity": counts(spec)},
+             "blocking": blocking, "verdict": verdict}
+      open(os.path.join(A, "verdict.json"), "w", encoding="utf-8").write(json.dumps(out, indent=2))
+      print(f"verdict: {verdict}  standards={len(std)} spec={len(spec)} blocking={len(blocking)}")
+      PYEOF
+
+  # ── POST — attach the report + verdict block to the PR (marker gf-stage:p4) ──
+  - id: post-report
+    depends_on: [emit-verdict]
+    trigger_rule: all_done
+    bash: |
+      export PATH="$PATH:/home/user/.local/bin"
+      set -uo pipefail
+      PR=$(cat "$ARTIFACTS_DIR/.pr-number")
+      BODY="$ARTIFACTS_DIR/review.md"
+      if [ ! -s "$BODY" ]; then echo "WARN: no review.md produced — nothing posted"; exit 0; fi
+      # gf-stage:p4 marker — the grey-factory orchestrator advances p4 on this marker.
+      printf '\n\n<!-- gf-stage:p4 -->\n' >> "$BODY"
+      if [ -s "$ARTIFACTS_DIR/verdict.json" ]; then
+        printf '<!-- gf-verdict:p4\n' >> "$BODY"
+        cat "$ARTIFACTS_DIR/verdict.json" >> "$BODY"
+        printf '\n-->\n' >> "$BODY"
+      fi
+      # ADVISORY-ONLY: p4 is a SUPPORT reviewer, not a gate. Post as a PLAIN PR COMMENT —
+      # never a `gh pr review --request-changes/--approve` review STATE — so p4 can never
+      # flip the PR's mergeable state or anchor the independent p5a spec review. Its verdict
+      # is consumed later, mechanically, by the p6 merge-gate (trigger-a-look) and by Fable
+      # at p6:blocked. (Was: mapped verdict -> PR review STATE; changed for pipeline use.)
+      V=$(grep -oE '"verdict": "[a-z-]+"' "$ARTIFACTS_DIR/verdict.json" 2>/dev/null | head -1 | sed 's/.*"\([a-z-]*\)"$/\1/')
+      if gh pr comment "$PR" --body-file "$BODY"; then
+        echo "posted two-axis review (advisory comment, verdict='${V:-unknown}') to PR #$PR"
+      else
+        echo "WARN: posting failed; report is at $BODY"
+      fi

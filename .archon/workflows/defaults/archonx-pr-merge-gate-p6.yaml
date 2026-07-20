@@ -1,9 +1,11 @@
 name: archonx-pr-merge-gate-p6
 description: |
   grey-factory stage P6 — the MECHANICAL merge gate. Reads the structured verdict the
-  p5 spec-review posted (`<!-- gf-verdict:p5 … -->`) and makes a DETERMINISTIC merge
-  decision — no new LLM judgment. Mergeable iff the review actually completed AND there
-  are no CRITICAL/HIGH blocking findings. On mergeable: opens ONE deduped follow-up
+  p5a spec-review posted (`<!-- gf-verdict:p5 … -->`) AND the advisory p4 two-axis
+  support verdict (`<!-- gf-verdict:p4 … -->`, TRIGGER-A-LOOK, fail-open if absent), and
+  makes a DETERMINISTIC merge decision — no new LLM judgment. Mergeable iff the p5a review
+  completed AND there are no CRITICAL/HIGH blocking findings on p5a AND none on p4. A
+  p4-only blocker HOLDs (→ Fable look), never merges silently. On mergeable: opens ONE deduped follow-up
   issue for the deferrable minor findings, posts the p6 marker, and (phase 1) recommends
   a human merge — or (phase 2, ARCHON_P6_AUTOMERGE=1) merges the PR. On HOLD: posts the
   blocking reasons and FAILS the run (no p6 marker) so the orchestrator parks p6:blocked.
@@ -104,6 +106,41 @@ nodes:
       print("verdict read: reviewed_all=%s blocking=%d deferrable=%d"
             % (v.get("reviewed_all"), len(v.get("blocking", [])), len(v.get("deferrable", []))))
       PYEOF
+      # ── p4 two-axis SUPPORT verdict (advisory; TRIGGER-A-LOOK). FAIL-OPEN: p4 is optional,
+      #    so its ABSENCE never holds — only a PRESENT p4 with CRITICAL/HIGH blocking does.
+      #    p4 items are {axis,kind,severity,title,location}; demote the version/.archive
+      #    convention here too (matches on title+location). Writes p4-verdict.json always. ──
+      "$PY" - << 'PYEOF'
+      import json, os, re
+      A = os.environ["ARTIFACTS_DIR"]
+      out = {"present": False, "blocking": []}
+      try:
+          text = open(os.path.join(A, ".allbodies"), encoding="utf-8", errors="replace").read()
+      except OSError:
+          text = ""
+      blocks = re.findall(r'<!--\s*gf-verdict:p4\s*(\{.*?\})\s*-->', text, re.S)
+      if blocks:
+          try:
+              v = json.loads(blocks[-1])
+              if v.get("schema") == "gf-verdict/1":
+                  _CONV_RE = re.compile(
+                      r'VERSION.{0,60}(?:increment|patch|bump)'
+                      r'|(?:increment|patch|bump).{0,60}VERSION'
+                      r'|\.archive\b|archive\s+cop(?:y|ies)'
+                      r'|version\s*[/\\&+]{1,3}\s*archive|version\s+and\s+archive'
+                      r'|frozen\s+snapshot\s+cop(?:y|ies)', re.I | re.S)
+                  blk = []
+                  for it in v.get("blocking", []):
+                      hay = (str(it.get("title", "")) + " " + str(it.get("location", "")))
+                      if not _CONV_RE.search(hay):
+                          blk.append(it)
+                  out = {"present": True, "verdict": v.get("verdict"),
+                         "standards": v.get("standards"), "spec": v.get("spec"), "blocking": blk}
+          except Exception as e:
+              print(f"WARN: gf-verdict:p4 present but unreadable ({e}) -> treated as no p4 blockers")
+      open(os.path.join(A, "p4-verdict.json"), "w", encoding="utf-8").write(json.dumps(out, indent=2))
+      print("p4 verdict: present=%s blocking=%d" % (out["present"], len(out["blocking"])))
+      PYEOF
 
   # ── Decide + act. Mergeable => follow-up issue + p6 marker + (phase2) merge. Else HOLD + exit 1. ──
   - id: decide-and-act
@@ -117,12 +154,21 @@ nodes:
       ISSUE=$(cat "$A/.issue-number"); BASE=$(cat "$A/.pr-base")
       PY=python3; "$PY" -c '' >/dev/null 2>&1 || PY=python
 
-      # MECHANICAL gate: mergeable iff review completed AND no CRITICAL/HIGH blocking.
+      # MECHANICAL gate (TRIGGER-A-LOOK): mergeable iff p5a review completed AND no p5a
+      # CRITICAL/HIGH blocking AND no p4 CRITICAL/HIGH blocking. A p4-only blocker does NOT
+      # merge -> HOLD -> orchestrator parks p6:blocked -> Fable adjudicates (sees both verdicts).
+      # p4 never auto-HOLDs "on its own authority" in the sense of a hard reject: Fable can
+      # still merge over it (as it does for false p5a blockers). It just pulls Fable in.
       MERGEABLE=$("$PY" - << 'PYEOF'
       import json, os
       A = os.environ["ARTIFACTS_DIR"]
       v = json.load(open(os.path.join(A, "p5-verdict.json"), encoding="utf-8"))
-      print("yes" if (v.get("reviewed_all") and not v.get("blocking")) else "no")
+      try:
+          p4 = json.load(open(os.path.join(A, "p4-verdict.json"), encoding="utf-8"))
+      except OSError:
+          p4 = {"blocking": []}
+      ok = bool(v.get("reviewed_all")) and not v.get("blocking") and not p4.get("blocking")
+      print("yes" if ok else "no")
       PYEOF
       )
 
@@ -132,14 +178,23 @@ nodes:
       A = os.environ["ARTIFACTS_DIR"]
       pr, issue, mergeable = sys.argv[1], sys.argv[2], sys.argv[3]
       v = json.load(open(os.path.join(A, "p5-verdict.json"), encoding="utf-8"))
+      try:
+          p4 = json.load(open(os.path.join(A, "p4-verdict.json"), encoding="utf-8"))
+      except OSError:
+          p4 = {"present": False, "blocking": []}
       def fmt(items):
           return "\n".join(f"- `{f['req']}` [{f['severity']}/{f['status']}] {f['text']}" for f in items) or "- (none)"
+      def fmt_p4(items):
+          return "\n".join(f"- [{f.get('severity')}/{f.get('axis')}] {f.get('title')} (`{f.get('location')}`)" for f in items) or "- (none)"
       decision = "merge" if mergeable == "yes" else "hold"
       lines = [f"# p6 merge-gate: {'MERGE-RECOMMENDED' if decision=='merge' else 'HOLD'}",
                "",
                f"PR #{pr} · issue #{issue} · verdict `{v.get('verdict')}` · reviewed {v['counts']['reviewed']}/{v['counts']['total']}",
                "",
-               "**Blocking (CRITICAL/HIGH):**", fmt(v.get("blocking", [])),
+               "**p5a blocking (CRITICAL/HIGH):**", fmt(v.get("blocking", [])),
+               "",
+               "**p4 support blocking (CRITICAL/HIGH):** "
+               + ("(p4 not run)" if not p4.get("present") else ""), fmt_p4(p4.get("blocking", [])),
                "",
                "**Deferrable (MEDIUM/LOW):**", fmt(v.get("deferrable", [])),
                "",
