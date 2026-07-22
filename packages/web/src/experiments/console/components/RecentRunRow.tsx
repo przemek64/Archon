@@ -2,7 +2,14 @@ import type { ReactElement } from 'react';
 import { useNavigate } from 'react-router';
 import { OriginBadge } from './OriginBadge';
 import type { Run } from '../primitives/run';
-import { shortRunId, formatElapsed, elapsedSince, formatCost } from '../lib/format';
+import {
+  shortRunId,
+  formatElapsed,
+  elapsedSince,
+  formatCost,
+  formatClock,
+  toDate,
+} from '../lib/format';
 import { useIsDocker, openInIde } from '../lib/health';
 import { statusTextClass } from '../lib/run-status';
 
@@ -57,10 +64,10 @@ export function RecentRunRow({
     navigate(`/console/p/${run.projectId}?${params.toString()}`);
   };
 
-  // Design v2 row grid: status | body | (project) | id | duration | cost | CLI.
+  // Design v2 row grid: status | body | (project) | id | started | duration | cost | CLI.
   const gridCols = showProject
-    ? 'grid-cols-[132px_minmax(0,1fr)_140px_84px_70px_64px_auto]'
-    : 'grid-cols-[132px_minmax(0,1fr)_84px_70px_64px_auto]';
+    ? 'grid-cols-[132px_minmax(0,1fr)_140px_84px_70px_70px_64px_auto]'
+    : 'grid-cols-[132px_minmax(0,1fr)_84px_70px_70px_64px_auto]';
 
   return (
     <div
@@ -116,7 +123,16 @@ export function RecentRunRow({
       <span className="text-right font-mono text-[12px] text-text-tertiary">
         {shortRunId(run.id)}
       </span>
-      <span className="text-right font-mono text-[12px] tabular-nums text-text-secondary">
+      <span
+        className="text-right font-mono text-[12px] tabular-nums text-text-tertiary"
+        title={`Workflow started ${toDate(run.startedAt).toLocaleString('en-GB', { timeZone: 'Europe/Dublin' })} (Dublin)`}
+      >
+        {formatClock(run.startedAt)}
+      </span>
+      <span
+        className="text-right font-mono text-[12px] tabular-nums text-text-secondary"
+        title="Run duration"
+      >
         {elapsed}
       </span>
       <span

@@ -1,5 +1,18 @@
 /** Formatting helpers for the console. Pure functions, no React. */
 
+/**
+ * Parse a backend timestamp into a Date. The DB stores run times as NAIVE UTC
+ * strings with no zone marker (e.g. `2026-07-22 16:20:22`); JS `Date` would parse
+ * those as the viewer's LOCAL time, so on a non-UTC machine every clock/duration
+ * was off by the local offset. When no zone designator is present we normalise to
+ * ISO-UTC (`T` + `Z`) so the instant is correct; strings that already carry a zone
+ * (`Z` or `±HH:MM`, e.g. event-stream timestamps) are parsed unchanged.
+ */
+export function toDate(iso: string): Date {
+  const hasZone = /(Z|[+-]\d{2}:?\d{2})$/.test(iso);
+  return new Date(hasZone ? iso : iso.replace(' ', 'T') + 'Z');
+}
+
 export function shortRunId(id: string): string {
   return id.replace(/-/g, '').slice(0, 8);
 }
@@ -15,13 +28,13 @@ export function formatElapsed(totalSeconds: number): string {
 }
 
 export function elapsedSince(startIso: string, endIso?: string): number {
-  const start = new Date(startIso).getTime();
-  const end = endIso !== undefined ? new Date(endIso).getTime() : Date.now();
+  const start = toDate(startIso).getTime();
+  const end = endIso !== undefined ? toDate(endIso).getTime() : Date.now();
   return (end - start) / 1000;
 }
 
 export function relativeTime(iso: string, now: number = Date.now()): string {
-  const t = new Date(iso).getTime();
+  const t = toDate(iso).getTime();
   const d = Math.floor((now - t) / 1000);
   if (d < 5) return 'just now';
   if (d < 60) return `${d.toString()}s ago`;
@@ -37,8 +50,8 @@ export function relativeTime(iso: string, now: number = Date.now()): string {
  */
 export function formatRelativeToBaseline(eventIso: string, baselineIso: string | null): string {
   if (baselineIso === null) return formatClock(eventIso);
-  const base = new Date(baselineIso).getTime();
-  const t = new Date(eventIso).getTime();
+  const base = toDate(baselineIso).getTime();
+  const t = toDate(eventIso).getTime();
   if (Number.isNaN(base) || Number.isNaN(t)) return formatClock(eventIso);
   const delta = Math.max(0, Math.floor((t - base) / 1000));
   const h = Math.floor(delta / 3600);
@@ -48,12 +61,18 @@ export function formatRelativeToBaseline(eventIso: string, baselineIso: string |
   return h > 0 ? `+${pad(h)}:${pad(m)}:${pad(s)}` : `+${pad(m)}:${pad(s)}`;
 }
 
+// All console wall-clock times render in Dublin time (Europe/Dublin), independent
+// of the viewer's machine/browser timezone, so timestamps are unambiguous.
+const DUBLIN_CLOCK = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/Dublin',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
 export function formatClock(iso: string): string {
-  const d = new Date(iso);
-  const hh = d.getHours().toString().padStart(2, '0');
-  const mm = d.getMinutes().toString().padStart(2, '0');
-  const ss = d.getSeconds().toString().padStart(2, '0');
-  return `${hh}:${mm}:${ss}`;
+  return DUBLIN_CLOCK.format(toDate(iso));
 }
 
 /**

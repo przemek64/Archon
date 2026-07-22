@@ -6,7 +6,14 @@ import { OriginBadge } from './OriginBadge';
 import { ApprovalPanel } from './ApprovalPanel';
 import { ApprovalContext } from './ApprovalContext';
 import type { Run } from '../primitives/run';
-import { shortRunId, formatElapsed, elapsedSince, formatCost } from '../lib/format';
+import {
+  shortRunId,
+  formatElapsed,
+  elapsedSince,
+  formatCost,
+  formatClock,
+  toDate,
+} from '../lib/format';
 import { useIsDocker, openInIde } from '../lib/health';
 import { statusTextClass, statusLabel } from '../lib/run-status';
 
@@ -123,7 +130,18 @@ export function ActiveRunCard({
                 {formatCost(run.costUsd)}
               </span>
             ) : null}
-            <span className="font-mono text-[11px] tabular-nums text-text-tertiary">{elapsed}</span>
+            <span
+              className="font-mono text-[11px] tabular-nums text-text-secondary"
+              title={`Workflow started ${toDate(run.startedAt).toLocaleString('en-GB', { timeZone: 'Europe/Dublin' })} (Dublin)`}
+            >
+              {formatClock(run.startedAt)}
+            </span>
+            <span
+              className="font-mono text-[11px] tabular-nums text-text-tertiary"
+              title="Elapsed since start"
+            >
+              {elapsed}
+            </span>
             {canOpenIde && run.workingPath !== null ? (
               <button
                 type="button"
